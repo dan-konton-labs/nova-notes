@@ -1,0 +1,9 @@
+# The workspace lives in iCloud Drive. A directory ending in ".nosync" is never
+# uploaded, so build output stays local.
+[build]
+target-dir = "target.nosync"
+
+# Test threads default to a 2 MiB stack, which the embedded database engine
+# can overflow in an unoptimised build.
+[env]
+RUST_MIN_STACK = "16777216"

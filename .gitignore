@@ -1,0 +1,28 @@
+# Build output (kept out of iCloud by the .nosync suffix)
+/target.nosync/
+/target/
+
+# Local settings and secrets
+.env
+.env.*
+!.env.example
+
+# Local data (embedded database, uploads, podcasts)
+/data/
+
+# The Python original is a separate clone used only as a reference
+/open-notebook/
+
+.DS_Store
+
+# Packaged source for the lab build
+/dist/
+__pycache__/
+
+# Editor-generated agent files
+/.agents/
+/.claude/
+
+# Editor bundle build tooling (the built bundle in static/editor is committed)
+/crates/nova-notes/editor/node_modules
+/crates/nova-notes/editor/node_modules.nosync/

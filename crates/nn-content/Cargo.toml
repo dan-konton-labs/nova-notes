@@ -1,0 +1,42 @@
+[package]
+name = "nn-content"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+nn-llm.workspace = true
+
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+url.workspace = true
+regex.workspace = true
+tempfile.workspace = true
+base64.workspace = true
+
+# HTML parsing and charset decoding
+scraper = { version = "0.29", default-features = false }
+encoding_rs = "0.8"
+
+# Documents (all pure Rust)
+pdf-extract = "0.12"
+lopdf = "0.42"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+quick-xml = "0.42"
+calamine = { version = "0.38", features = ["dates"] }
+csv = "1"
+
+# Token counting (o200k_base, vocabulary embedded in the crate)
+tiktoken-rs = "0.12"
+unicode-general-category = "1"
+
+[dev-dependencies]
+wiremock = "0.6"

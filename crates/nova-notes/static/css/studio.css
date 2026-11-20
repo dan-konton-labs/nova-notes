@@ -1,0 +1,56 @@
+/* Studio panel: meetings, explainers and infographics. */
+.st-panel .panel-body { gap: 14px; }
+.st-wrap { overflow-wrap: anywhere; }
+
+/* Generator jobs */
+.st-jobs { display: flex; flex-direction: column; gap: 8px; }
+.st-jobs:empty { display: none; }
+.st-job { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border-radius: var(--radius-sm); font-size: .88rem; }
+.st-job-pending { border: 1px dashed var(--teal); color: var(--ink-soft); align-items: center; }
+.st-job-failed { background: var(--warn-tint); border: 1px solid transparent; }
+.st-job-failed strong { color: var(--warn); }
+.st-job-failed p { max-height: 6.5em; overflow-y: auto; margin-top: 2px; }
+
+/* Generator dialogs */
+.st-option { display: flex; flex-direction: column; gap: 2px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius-sm); }
+.st-option-selected { border-color: var(--teal); background: var(--teal-tint); }
+.st-fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+.st-fieldset legend { font-weight: 550; font-size: .88rem; margin-bottom: 6px; padding: 0; }
+.st-styles { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); }
+.st-style { position: relative; display: flex; gap: 8px; align-items: flex-start; padding: 8px; margin: 0; border: 1px solid var(--line); border-radius: var(--radius-sm); cursor: pointer; font-weight: 400; }
+.st-style:hover { background: var(--recessed); }
+.st-style input, .st-aspect input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.st-style:has(input:checked), .st-aspect:has(input:checked) { border-color: var(--teal); background: var(--teal-tint); }
+.st-style:has(input:focus-visible), .st-aspect:has(input:focus-visible) { outline: 2px solid var(--teal); outline-offset: 2px; }
+.st-swatch { display: flex; align-items: flex-end; gap: 2px; width: 32px; height: 32px; flex: none; padding: 4px; border-radius: 6px; border: 1px solid var(--line); overflow: hidden; }
+.st-swatch i { display: block; width: 7px; border-radius: 2px; }
+.st-style-name { display: block; font-weight: 600; font-size: .88rem; }
+.st-style-desc { display: block; font-size: .78rem; color: var(--ink-soft); line-height: 1.35; }
+.st-aspects { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.st-aspect { position: relative; display: flex; align-items: center; justify-content: center; height: 38px; margin: 0; border: 1px solid var(--line); border-radius: var(--radius-sm); cursor: pointer; font-size: .82rem; }
+.st-aspect:hover { background: var(--recessed); }
+
+/* Recorder */
+.st-recorder { display: flex; flex-direction: column; gap: 8px; padding-top: 4px; border-top: 1px solid var(--line); }
+.st-recorder h4 { font-size: .95rem; padding-top: 8px; }
+.st-rec-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); display: inline-block; }
+.st-recorder.st-live .st-rec-dot { animation: st-pulse 1.2s ease-in-out infinite; }
+.st-timer { font-family: var(--mono); font-size: .85rem; color: var(--ink-soft); }
+@keyframes st-pulse { 50% { opacity: .3; } }
+@media (prefers-reduced-motion: reduce) { .st-recorder.st-live .st-rec-dot { animation: none; } }
+
+/* Meeting cards */
+.st-meeting { display: block; }
+.st-meeting-body { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.st-meeting-title { font-size: .95rem; overflow-wrap: anywhere; }
+.st-meeting .flash { padding: 7px 10px; }
+.st-pending { color: var(--teal); display: flex; align-items: center; gap: 6px; }
+.st-section { border-top: 1px solid var(--line); padding-top: 6px; }
+.st-section > summary { cursor: pointer; font-weight: 600; font-size: .85rem; color: var(--ink-soft); padding: 2px 0; }
+.st-section[open] > summary { margin-bottom: 6px; }
+.st-transcript { max-height: 320px; overflow-y: auto; }
+.st-actions { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; }
+.st-action { border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 8px; display: flex; flex-direction: column; gap: 4px; }
+.st-action .check { align-items: flex-start; font-size: .9rem; }
+.st-evidence { margin: 0; border-left: 2px solid var(--line); padding-left: 8px; font-size: .8rem; color: var(--ink-soft); overflow-wrap: anywhere; }
+.st-meetings .empty { padding: 18px 14px; font-size: .88rem; }

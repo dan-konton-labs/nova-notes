@@ -1,0 +1,225 @@
+/* Notebooks: the notebook list and the notebook page. */
+
+/* List */
+.nb-search input { width: min(260px, 60vw); }
+.nb-card { display: flex; flex-direction: column; gap: 8px; position: relative; }
+.nb-card .card-title { color: var(--ink); }
+.nb-card-foot { border-top: 1px solid var(--line); padding-top: 8px; margin-top: auto; }
+.nb-folder .card-title, .nb-section .card-title { color: var(--teal); }
+.nb-archived > summary { cursor: pointer; list-style: none; margin-bottom: 10px; }
+.nb-archived > summary::-webkit-details-marker { display: none; }
+.nb-archived > summary h2::before { content: "▸ "; color: var(--ink-faint); }
+.nb-archived[open] > summary h2::before { content: "▾ "; }
+.nb-recent > .row { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 8px; }
+.nb-recent-item { display: grid; grid-template-columns: auto minmax(0, 1fr); grid-template-areas: "title title" "badge date"; gap: 6px 8px; align-items: center; min-width: 0; color: var(--ink); }
+.nb-recent-item > .truncate { grid-area: title; font-weight: 600; }
+.nb-recent-item > .badge { grid-area: badge; justify-self: start; }
+.nb-recent-item > .small { grid-area: date; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.nb-recent-item:hover { text-decoration: none; }
+.nb-narrow { max-width: 620px; }
+.nb-danger-text { color: var(--danger); font-weight: 550; }
+.nb-divided { border-top: 1px solid var(--line); padding-top: 12px; }
+
+/* Pop-over menus built on <details> */
+.nb-menu { position: relative; }
+.nb-menu > summary { list-style: none; }
+.nb-menu > summary::-webkit-details-marker { display: none; }
+.nb-menu-body { position: absolute; right: 0; top: calc(100% + 6px); z-index: 30; min-width: 230px; padding: 8px; background: color-mix(in srgb, var(--window) 86%, transparent); -webkit-backdrop-filter: blur(28px) saturate(1.8); backdrop-filter: blur(28px) saturate(1.8); border-radius: 16px; box-shadow: var(--shadow-lg); }
+.nb-menu-label { font-size: .72rem; font-weight: 650; color: var(--ink-faint); padding: 6px 10px 0; }
+.nb-menu-body label { font-size: .8rem; }
+.nb-menu-body .btn { justify-content: flex-start; background: transparent; height: 30px; }
+.nb-menu-body .btn:hover { background: var(--accent); color: var(--on-accent); }
+
+/* Notebook page: a toolbar over three collapsible panes. */
+.main:has(.nb-workspace) { max-width: none; height: 100vh; height: 100dvh; padding: 12px 14px 14px; display: flex; flex-direction: column; overflow: hidden; }
+.nb-workspace { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 12px; }
+
+/* Toolbar */
+.nb-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px 20px; flex-wrap: wrap; padding: 2px 6px 0; }
+.nb-titleblock { min-width: 0; flex: 1 1 320px; }
+.nb-title-row { flex-wrap: nowrap; gap: 8px; }
+.nb-title-row h1 { font-size: 1.4rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nb-meta { display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; margin-top: 1px; }
+.nb-desc { color: var(--ink-soft); }
+.nb-toolbar-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.nb-destructive { color: var(--danger); }
+
+/* Panes. Notes is the flexible one: it takes whatever Sources and Chat leave. */
+.nb-cols { flex: 1 1 auto; min-height: 0; display: flex; gap: 12px; }
+.nb-col { min-width: 0; min-height: 0; display: flex; position: relative; }
+.nb-col-inner { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 12px; overflow-x: hidden; overflow-y: auto;
+  /* Room for the panes' shadows inside the scroll area, cancelled out by the margin. */
+  padding: 6px; margin: -6px; overscroll-behavior: contain; }
+.nb-col-inner > .nb-pane, .nb-col-inner > .panel { flex: none; }
+.nb-col-sources .nb-col-inner > .nb-pane, .nb-col-chat .nb-col-inner > .nb-pane { flex: 1 1 auto; min-height: 0; }
+.nb-col-sources .panel-body, .nb-col-chat .panel-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.nb-col-sources .panel-body > * { flex: none; }
+.nb-col-sources .nb-col-inner, .nb-col-chat .nb-col-inner { overflow-y: hidden; }
+
+.nb-col-sources { flex: 0 0 clamp(250px, 22%, 340px); }
+.nb-col-notes { flex: 1 1 0; }
+.nb-col-chat { flex: 0 0 clamp(340px, 31%, 480px); }
+@media (min-width: 901px) {
+  .nb-col { transition: flex-basis .26s var(--ease); }
+  /* Collapsed: a slim rail that opens the pane again. */
+  .nb-cols[data-sources="closed"] .nb-col-sources, .nb-cols[data-notes="closed"] .nb-col-notes, .nb-cols[data-chat="closed"] .nb-col-chat { flex: 0 0 48px; }
+  .nb-cols[data-sources="closed"] .nb-col-sources .nb-col-inner, .nb-cols[data-notes="closed"] .nb-col-notes .nb-col-inner, .nb-cols[data-chat="closed"] .nb-col-chat .nb-col-inner { display: none; }
+  .nb-cols[data-sources="closed"] .nb-col-sources .nb-rail, .nb-cols[data-notes="closed"] .nb-col-notes .nb-rail, .nb-cols[data-chat="closed"] .nb-col-chat .nb-rail { display: flex; }
+  /* Free space goes to the nearest open pane: Notes first, then Chat, then Sources. */
+  .nb-cols[data-notes="closed"][data-chat="open"] .nb-col-chat { flex: 1 1 0; }
+  .nb-cols[data-notes="closed"][data-chat="closed"][data-sources="open"] .nb-col-sources { flex: 1 1 0; }
+}
+
+.nb-rail { display: none; flex: 1 1 auto; flex-direction: column; align-items: center; gap: 14px; padding: 14px 0; border: 0; border-radius: var(--radius); background: var(--pane); color: var(--ink-soft);
+  box-shadow: var(--shadow); cursor: pointer; font: 600 .8rem var(--sans); transition: background .12s ease, color .12s ease; }
+.nb-rail:hover { background: var(--fill-3); color: var(--ink); }
+.nb-rail-icon svg { width: 16px; height: 16px; display: block; }
+.nb-rail-label { writing-mode: vertical-rl; transform: rotate(180deg); letter-spacing: .02em; }
+
+.nb-pane { min-width: 0; }
+.nb-pane .panel-head { flex-wrap: wrap; gap: 6px 8px; padding-left: 10px; }
+.nb-pane-title { flex: 1 1 auto; min-width: 0; font: 650 .92rem var(--display); letter-spacing: -.012em; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nb-head-actions { flex-wrap: nowrap; gap: 6px; }
+.nb-ctx-stats { flex: 1 0 100%; padding-left: 36px; margin-top: -4px; }
+.nb-ctx-stats:empty { display: none; }
+
+/* Narrow windows: one pane at a time, picked with the toolbar's Sources / Notes / Chat control. */
+@media (max-width: 900px) {
+  .nb-cols { display: block; position: relative; }
+  .nb-col { display: none; height: 100%; }
+  .nb-cols[data-tab="sources"] .nb-col-sources, .nb-cols[data-tab="notes"] .nb-col-notes, .nb-cols[data-tab="chat"] .nb-col-chat { display: flex; }
+  .nb-rail, .nb-collapse { display: none !important; }
+  .nb-ctx-stats { padding-left: 0; }
+  .nb-toolbar-actions { width: 100%; justify-content: space-between; }
+}
+
+/* Sources */
+.nb-source { flex-direction: column; min-width: 0; }
+.nb-source > * { min-width: 0; max-width: 100%; }
+.nb-col-sources .panel-body { overflow-x: hidden; }
+.nb-source-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nb-row-actions { justify-content: space-between; }
+.nb-ctx { width: auto; padding: 2px 22px 2px 10px; height: 24px; font-size: .78rem; border-radius: 999px; background-position: calc(100% - 12px) 55%, calc(100% - 8px) 55%; background-size: 4px 4px; }
+.nb-more { align-self: center; }
+.nb-pick-list { max-height: 50vh; overflow-y: auto; }
+.nb-pick-list .item { align-items: center; }
+.nb-type-picker { border: 0; padding: 0; margin: 0; display: flex; gap: 16px; flex-wrap: wrap; }
+.nb-type-picker legend { font-weight: 550; font-size: .88rem; margin-bottom: 6px; }
+fieldset { border: 0; padding: 0; margin: 0; }
+fieldset legend { font-weight: 550; font-size: .88rem; margin-bottom: 6px; padding: 0; }
+
+/* Notes */
+.nb-notes-pane { position: relative; }
+.nb-note-grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr)); }
+.nb-note { display: flex; flex-direction: column; gap: 6px; padding: 10px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface); min-height: 10rem; min-width: 0; }
+.nb-note:hover { border-color: var(--ink-faint); }
+.nb-note-title { font-weight: 600; color: var(--ink); overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.nb-note-preview { overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+.nb-note-foot { margin-top: auto; }
+.nb-thumb { width: 100%; max-height: 120px; object-fit: cover; object-position: top; border-radius: 6px; background: var(--sunken); }
+.nb-drop-hint { display: none; }
+.nb-dragging { outline: 2px dashed var(--teal); outline-offset: -4px; }
+.nb-dragging .nb-drop-hint { display: block; text-align: center; padding: 18px; border: 1px dashed var(--teal); border-radius: var(--radius-sm); color: var(--teal); font-weight: 550; }
+.nb-note-text { min-height: 280px; font-family: var(--mono); font-size: .9rem; }
+.nb-note-page { max-width: 900px; margin-inline: auto; }
+.nb-frame { width: 100%; height: 70vh; border: 1px solid var(--line); border-radius: var(--radius-sm); background: #fff; }
+.nb-infographic { display: block; max-width: 100%; margin: 0 auto; border-radius: var(--radius-sm); background: var(--sunken); }
+dialog.nb-dialog#nb-modal { width: min(960px, calc(100vw - 24px)); }
+dialog.nb-dialog#nb-modal .dialog-body { max-height: 80vh; }
+dialog.nb-dialog#nb-modal.nb-full { width: 100vw; max-width: 100vw; height: 100vh; max-height: 100vh; margin: 0; border-radius: 0; }
+dialog.nb-dialog#nb-modal.nb-full .dialog-body { max-height: calc(100vh - 64px); }
+dialog.nb-dialog#nb-modal.nb-full .nb-frame { height: calc(100vh - 190px); }
+dialog.nb-dialog#nb-modal.nb-full .nb-infographic { max-height: calc(100vh - 190px); width: auto; }
+.nb-viewer-head { flex-wrap: wrap; gap: 8px; }
+.nb-viewer-head h3 { margin: 0; }
+
+/* Chat */
+.nb-chat-pane .panel-body.chat { flex: 1 1 auto; min-height: 0; overflow: hidden; }
+.nb-chat-pane .nb-sessions { flex: none; }
+.nb-chat-pane .nb-chat-form { flex: none; }
+.nb-sessions > summary { cursor: pointer; font-weight: 550; font-size: .88rem; color: var(--ink-soft); }
+.nb-sessions[open] > summary { margin-bottom: 8px; }
+.nb-session[aria-current="true"] { background: var(--accent-tint); }
+.nb-inline-edit > summary { cursor: pointer; color: var(--ink-faint); }
+.nb-chat-log { flex: 1 1 auto; max-height: none; min-height: 0; }
+.nb-chat-empty { padding: 20px 12px; }
+.nb-msg-actions { margin-top: 6px; gap: 4px; }
+.nb-chat-form { flex-direction: column; align-items: stretch; }
+.nb-chat-form textarea { min-height: 64px; }
+.nb-chat-form > .btn { align-self: flex-end; }
+.nb-model { display: inline-flex; align-items: center; gap: 6px; margin: 0; font-weight: 500; font-size: .8rem; }
+.nb-model select { width: auto; max-width: 220px; padding: 2px 6px; font-size: .8rem; }
+.msg.nb-pending { opacity: .7; }
+
+/* Drag a notebook onto a folder. */
+.nb-card[draggable="true"] { cursor: grab; }
+.nb-dragging-card { opacity: 0.5; }
+.nb-folder.nb-drop-target { outline: 2px dashed var(--teal); outline-offset: 2px; }
+
+/* Rich note editor (static/editor) */
+.nb-rich { gap: 10px; }
+.nb-rich-title { font-weight: 600; font-size: 1.05rem; }
+.nb-rich-surface { position: relative; height: max(240px, 70dvh); border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface); overflow: hidden; }
+.nb-rich-loading { padding: 16px; display: flex; align-items: center; gap: 8px; }
+.nb-mode { display: inline-flex; }
+.nb-mode .btn { border-radius: 0; }
+.nb-mode .btn:first-child { border-radius: var(--radius-sm) 0 0 var(--radius-sm); }
+.nb-mode .btn:last-child { border-radius: 0 var(--radius-sm) var(--radius-sm) 0; margin-left: -1px; }
+.nb-mode .btn[aria-pressed="true"] { background: var(--accent-tint); color: var(--accent-text); }
+.nb-backlinks { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.nb-backlink { cursor: pointer; text-decoration: none; }
+
+/* Floating pages. A note opens as a sheet on the canvas: no boxed title, no
+   bordered editor, just the page. Used by the notebook's Notes column, the
+   standalone note page and the Notes view (/notes). */
+.nn-page { background: var(--pane); border-radius: var(--radius); box-shadow: var(--shadow); display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.nn-page-bar { display: flex; align-items: center; gap: 6px 8px; padding: 8px 10px 8px 12px; min-height: 52px; border-bottom: .5px solid var(--line); flex-wrap: wrap; }
+.nn-page-bar-main { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; }
+.nn-page-actions { flex-wrap: nowrap; gap: 2px; }
+.nn-page-actions form { margin: 0; }
+.nn-page-actions .btn[aria-pressed="true"] { background: var(--accent-tint); color: var(--accent-text); }
+.nn-page-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 26px clamp(18px, 5vw, 72px) 48px; display: flex; flex-direction: column; gap: 10px; }
+.nn-page-body > * { width: 100%; max-width: 780px; margin-inline: auto; }
+.nn-page-title { font-size: 2rem; letter-spacing: -.03em; }
+.nn-page-foot { display: flex; justify-content: space-between; gap: 12px; padding-top: 8px; }
+.nn-page .nb-rich { flex: 1 0 auto; display: flex; flex-direction: column; gap: 6px; }
+.nn-page .nb-viewer-head { order: 0; flex: 0 0 auto; justify-content: space-between; font-size: .8rem; }
+.nn-page .nb-viewer-head .btn { height: 24px; }
+.nn-page .nb-rich-title { order: 1; flex: 0 0 auto; height: auto; padding: 4px 0; font: 700 2rem/1.15 var(--display); letter-spacing: -.03em; color: var(--ink);
+  background: transparent !important; border: 0; border-radius: 0; box-shadow: none; outline: none; }
+.nn-page .nb-rich-title::placeholder { color: var(--ink-faint); }
+.nn-page .nb-rich-surface { order: 2; flex: 1 0 auto; height: auto; min-height: 55vh; border: 0; border-radius: 0; background: transparent; overflow: visible; }
+.nn-page .nb-rich-surface affine-editor-container { min-height: 55vh; }
+.nn-page .nb-rich-surface .affine-page-viewport { height: auto; overflow: visible; }
+.nn-page .nb-rich-surface .playground-page-editor-container,
+.nn-page .nb-rich-surface .affine-page-root-block-container { padding-left: 0 !important; padding-right: 0 !important; max-width: none !important; }
+.nn-page .nb-rich-surface:has(affine-edgeless-root) { height: 70vh; border-radius: var(--radius-sm); overflow: hidden; box-shadow: inset 0 0 0 .5px var(--separator); }
+.nn-page .nb-backlinks { order: 4; padding-top: 10px; border-top: .5px solid var(--line); }
+.nn-page .nb-frame { height: calc(100vh - 230px); border: 0; box-shadow: inset 0 0 0 .5px var(--separator); }
+/* The notebook menu on a page: "In Garden ▾" */
+.nn-file-menu > summary { max-width: 100%; gap: 6px; background: var(--fill-3); }
+.nn-file-menu > summary svg { width: 13px; height: 13px; flex: none; }
+.nn-file-menu .nb-menu-body { left: 0; right: auto; width: 290px; }
+.nn-file-list { display: flex; flex-direction: column; gap: 2px; max-height: 240px; overflow-y: auto; padding: 2px; }
+.nn-file-list .check { padding: 5px 8px; border-radius: 8px; font-size: .86rem; min-width: 0; }
+.nn-file-list .check:hover { background: var(--fill-3); }
+.nn-file-new { flex-wrap: nowrap; }
+.nn-file-new input { height: 28px; padding: 4px 10px; font-size: .84rem; }
+.nn-file-menu .hint { padding: 0 4px; }
+.nn-file-menu .nb-menu-body .btn-primary, .nn-file-menu .nb-menu-body .btn-primary:hover { justify-content: center; background: var(--accent); color: var(--on-accent); }
+/* In the notebook: the page fills the Notes column and scrolls inside itself. */
+.nb-col-notes .nb-col-inner:has(> .nn-page) { overflow-y: hidden; }
+.nb-col-inner > .nn-page { flex: 1 1 auto; }
+.nb-note-open .nb-collapse { margin-left: 2px; }
+/* The standalone note page grows with its content instead. */
+.nb-note-page.nn-page { max-width: 980px; margin-inline: auto; }
+.nb-note-page .nn-page-body { overflow: visible; }
+
+/* ---- Transport: copy notes/folders from the Notes library in ---- */
+.nb-transport { min-width: 0; }
+.nb-transport h4 { font: 650 1rem var(--display); }
+.nb-transport-list { max-height: 230px; overflow-y: auto; padding: 2px; }
+.nb-transport-row { gap: 10px; padding: 5px 8px; border-radius: 8px; margin: 0; }
+.nb-transport-row:hover { background: var(--fill-4); }
+.nb-transport-row .badge { font-size: .68rem; }
+.nb-transport-row .btn { flex: none; }

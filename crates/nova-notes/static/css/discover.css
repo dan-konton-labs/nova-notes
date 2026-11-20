@@ -1,0 +1,19 @@
+/* Discover: the "Discover notebook" / "Discover + podcast" dialog. */
+.disc-dialog .dialog-body { gap: 14px; }
+.disc-mode { border: 0; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px 18px; }
+.disc-mode legend { font-weight: 550; font-size: .88rem; margin-bottom: 6px; padding: 0; }
+.disc-choice { display: inline-flex; align-items: center; gap: 6px; margin: 0; font-weight: 500; cursor: pointer; }
+.disc-count input { max-width: 120px; }
+.disc-error { margin: 0; padding: 9px 12px; border-radius: var(--radius-sm); background: var(--danger-tint); color: var(--danger); font-size: .9rem; }
+
+/* Podcast fields only in podcast mode (no script needed). */
+.disc-podcast { display: none; flex-direction: column; gap: 14px; padding: 12px; border: 1px dashed var(--line); border-radius: var(--radius-sm); background: var(--recessed); }
+.disc-form:has(input[name="mode"][value="podcast"]:checked) .disc-podcast { display: flex; }
+
+/* Busy label while the request runs (htmx adds .htmx-request to the form). */
+.disc-busy { display: none; }
+.disc-form.htmx-request .disc-idle { display: none; }
+.disc-form.htmx-request .disc-busy { display: inline; }
+
+.disc-page { max-width: 640px; padding: 0; }
+.disc-page .dialog-body { max-height: none; }

@@ -1,0 +1,6 @@
+-- Notes workspace. Additive and idempotent; the Python build never reads it.
+
+-- Pinned notes. A pin is its own record (note_pin:<note key>) so pinning
+-- never touches the note and never bumps its `updated` time.
+DEFINE TABLE IF NOT EXISTS note_pin SCHEMALESS;
+DEFINE INDEX IF NOT EXISTS idx_note_pin_note ON TABLE note_pin COLUMNS note;

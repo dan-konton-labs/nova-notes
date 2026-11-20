@@ -1,0 +1,13 @@
+# Only Cargo.toml, Cargo.lock and crates/ are needed to build.
+target.nosync
+target
+open-notebook
+data
+docs
+.env
+.env.*
+.git
+.claude
+.agents
+.cargo
+**/.DS_Store

@@ -1,0 +1,2 @@
+-- Keep freshly opened, untouched editors out of note listings and context.
+DEFINE FIELD IF NOT EXISTS untouched_draft ON TABLE note TYPE option<bool>;

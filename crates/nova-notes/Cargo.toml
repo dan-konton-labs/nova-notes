@@ -1,0 +1,73 @@
+[package]
+name = "nova-notes"
+description = "Nova Notes: a Rust rebuild of the Open Notebook research assistant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+default-run = "nova-notes"
+
+[lib]
+name = "nova_notes"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nova-notes"
+path = "src/main.rs"
+
+[dependencies]
+nn-llm.workspace = true
+nn-ai.workspace = true
+nn-content.workspace = true
+nn-podcast.workspace = true
+
+surrealdb = { version = "=2.7.0", default-features = false, features = ["kv-mem", "kv-surrealkv", "protocol-ws", "protocol-http", "rustls"] }
+axum = { version = "0.8", features = ["multipart", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "limit", "trace"] }
+maud = { version = "0.27", features = ["axum"] }
+minijinja = { version = "2", features = ["loader", "json"] }
+include_dir = "0.7"
+dotenvy = "0.15"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+ammonia = "4"
+# Generated explainers (HTML text) and infographics (SVG sanitising); all three
+# are already in the build through ammonia, nn-content and nn-podcast.
+scraper = { version = "0.29", default-features = false }
+html5ever = "0.40"
+roxmltree = "0.21"
+
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+async-stream.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+regex.workspace = true
+url.workspace = true
+base64.workspace = true
+rand.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+pbkdf2.workspace = true
+# Fernet (credential encryption) is AES-128-CBC + HMAC-SHA256; pure Rust, already in the lockfile.
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+hex.workspace = true
+once_cell.workspace = true
+tempfile.workspace = true
+mime_guess.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+wiremock = "0.6"

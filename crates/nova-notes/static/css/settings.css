@@ -1,0 +1,66 @@
+/* Styles for the settings pages: Models (/settings/models), Settings, Advanced. */
+.set-narrow { max-width: 640px; }
+.set-narrow-wide { max-width: 900px; }
+.set-help { border-top: 1px solid var(--line); padding-top: 14px; }
+.set-required { color: var(--danger); margin-left: 2px; }
+.set-italic { font-style: italic; }
+.set-danger { color: var(--danger); }
+.set-warn { color: var(--warn); }
+.set-end { justify-content: flex-end; }
+.set-foot { justify-content: flex-end; padding-top: 6px; }
+
+/* Default model slots */
+.set-slots { display: grid; gap: 12px; }
+.set-slots-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.set-slots-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+@media (max-width: 1100px) { .set-slots-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 680px) { .set-slots-4, .set-slots-3 { grid-template-columns: minmax(0, 1fr); } }
+.set-slots label { font-size: .8rem; }
+.set-slots select { font-size: .88rem; padding: 6px 9px; }
+select.set-invalid { border-color: var(--danger); }
+.set-advanced { border-top: 1px solid var(--line); padding-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+
+/* Provider cards */
+.set-provider.set-configured { border-left: 3px solid var(--fern); }
+.set-provider-name { font-size: 1.05rem; }
+.set-add { width: 100%; border-style: dashed; }
+.set-cred { flex-direction: column; }
+.set-cred:hover { border-color: var(--line); }
+.set-test-message { color: var(--danger); max-width: 320px; display: inline-block; vertical-align: middle; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.set-model-row { display: flex; align-items: flex-start; gap: 8px; }
+.set-model-row > .badge { margin-top: 3px; flex: none; }
+.set-chips { gap: 6px; }
+.set-chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 4px 2px 9px; border-radius: 999px; background: var(--sunken); font-size: .8rem; }
+.set-chip code { font-size: .8rem; }
+.set-chip-default { background: var(--fern-tint); color: var(--fern); }
+.set-chip-btn { border: 0; background: transparent; color: var(--ink-faint); cursor: pointer; padding: 0 4px; font: inherit; font-size: .75rem; border-radius: 999px; }
+.set-chip-btn:hover { color: var(--ink); background: var(--recessed); }
+.set-chip-btn.set-danger:hover { color: var(--danger); }
+.set-actions { white-space: nowrap; text-align: right; }
+
+/* All models */
+.set-add-model summary { cursor: pointer; color: var(--teal); font-weight: 550; }
+.set-form-grid { display: grid; gap: 12px; grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: end; margin-top: 12px; }
+.set-form-grid > .row { grid-column: 1 / -1; }
+@media (max-width: 900px) { .set-form-grid { grid-template-columns: minmax(0, 1fr); } }
+
+/* Forms */
+.set-key { display: flex; gap: 6px; align-items: center; }
+.set-fieldset { border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 10px 12px; margin: 0; }
+.set-fieldset legend { font-weight: 550; font-size: .88rem; padding: 0 4px; }
+.set-discover-list { display: flex; flex-direction: column; gap: 2px; max-height: 320px; overflow-y: auto; border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 6px; }
+.set-discover-item { padding: 4px 6px; border-radius: 6px; cursor: pointer; min-width: 0; }
+.set-discover-item:hover { background: var(--recessed); }
+.set-details { background: var(--sunken); padding: 10px; border-radius: var(--radius-sm); max-height: 240px; overflow: auto; font-size: .8rem; }
+
+/* Settings page */
+.set-settings { max-width: 900px; }
+.set-help-toggle summary, .set-faq summary { cursor: pointer; font-size: .85rem; color: var(--ink-soft); margin-top: 6px; }
+.set-help-toggle p, .set-faq p { margin-top: 6px; }
+
+/* Advanced page */
+.set-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.set-stats > div { display: flex; flex-direction: column; }
+.set-stats strong { font: 650 1.5rem var(--mono); }
+@media (max-width: 600px) { .set-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.set-faq { border-top: 1px solid var(--line); padding-top: 10px; }

@@ -1,0 +1,40 @@
+/* Styles for the podcasts pages. */
+.pod-counts .badge strong { font-family: var(--mono); color: var(--ink); margin-left: 2px; }
+.pod-group { display: flex; flex-direction: column; gap: 12px; }
+.pod-group > div:first-child, .pod-group > summary { border-bottom: 1px solid var(--line); padding-bottom: 8px; }
+details.pod-group > summary { cursor: pointer; list-style: none; display: flex; flex-direction: column; gap: 2px; }
+details.pod-group > summary::-webkit-details-marker { display: none; }
+details.pod-group > summary h3::after { content: " ▾"; color: var(--ink-faint); font-size: .85rem; }
+details.pod-group[open] > summary h3::after { content: " ▴"; }
+details.pod-group[open] > summary { margin-bottom: 12px; }
+.pod-grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); }
+@media (max-width: 820px) { .pod-grid { grid-template-columns: minmax(0, 1fr); } }
+.pod-episode h3 a { color: var(--ink); }
+.pod-progress progress { flex: 1 1 auto; width: auto; }
+.pod-progress span { width: 40px; text-align: right; font-family: var(--mono); }
+.pod-audio { margin-top: 2px; }
+.pod-danger { color: var(--danger); }
+.pod-box { border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--recessed); padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+.pod-facts { display: grid; gap: 10px 18px; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
+.pod-facts p.faint { font-size: .75rem; text-transform: uppercase; letter-spacing: .06em; }
+.pod-actions { justify-content: flex-end; }
+.pod-profiles { align-items: start; }
+.pod-explainer > summary, .pod-publish > summary, details.card.flat > summary { cursor: pointer; }
+.pod-explainer ul, .pod-explainer ol { margin: 0; padding-left: 1.3em; }
+.pod-drop.pod-dragging textarea { outline: 2px dashed var(--primary); outline-offset: 2px; }
+.pod-script { font-family: var(--mono); font-size: .82rem; min-height: 240px; }
+.pod-file { position: relative; overflow: hidden; margin: 0; }
+.pod-file input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; padding: 0; }
+.pod-too-long { color: var(--danger); }
+.pod-mono { font-family: var(--mono); font-size: .8rem; }
+.pod-feed-row input { min-width: 220px; }
+.pod-narrow { max-width: 220px; }
+.pod-artwork-row { align-items: flex-start; gap: 16px; }
+.pod-artwork { width: 96px; height: 96px; border-radius: var(--radius-sm); border: 1px solid var(--line); object-fit: cover; flex: none; }
+.pod-artwork-empty { border-style: dashed; display: grid; place-items: center; text-align: center; font-size: .75rem; color: var(--ink-faint); padding: 6px; }
+
+/* A notebook's podcasts, on the notebook page. */
+.pod-notebook-title { margin: 0; font-size: 0.8rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-faint); }
+.pod-notebook-item { padding-top: 0.6rem; border-top: 1px solid var(--line); }
+.pod-notebook-item .pod-audio { width: 100%; }
+.pod-notebook-empty { margin: 0; }

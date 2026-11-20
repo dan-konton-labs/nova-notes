@@ -1,0 +1,13 @@
+-- Nova Notes (Rust) track, recorded in _nova_rust_migrations.
+-- Everything here is additive and idempotent so the same database can still be
+-- opened by the Python build.
+
+-- Chat history. The Python build keeps this in a LangGraph SQLite checkpoint;
+-- the Rust build keeps it next to the session it belongs to.
+DEFINE TABLE IF NOT EXISTS chat_message SCHEMALESS;
+DEFINE INDEX IF NOT EXISTS idx_chat_message_session ON TABLE chat_message COLUMNS session;
+
+-- Background jobs. The Python build's surreal-commands library creates this
+-- table implicitly on first insert.
+DEFINE TABLE IF NOT EXISTS command SCHEMALESS;
+DEFINE INDEX IF NOT EXISTS idx_command_status ON TABLE command COLUMNS status;

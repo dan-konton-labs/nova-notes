@@ -1,0 +1,63 @@
+/* Ask and Search, Transformations. */
+.sr-eyebrow { font-size: .72rem; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-faint); margin-bottom: 6px; }
+.sr-mono { font-family: var(--mono); }
+.badge.sr-mono { font-size: .7rem; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.sr-end { justify-content: flex-end; }
+.sr-warn { color: var(--warn); }
+.sr-flash { margin-bottom: 14px; }
+
+/* Collapsible bits share one summary style. */
+.sr-scope > summary, .sr-models > summary, .sr-stage > summary, .sr-matches > summary, .sr-tf-details > summary {
+  cursor: pointer; list-style: none; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sr-scope > summary::-webkit-details-marker, .sr-models > summary::-webkit-details-marker, .sr-stage > summary::-webkit-details-marker,
+.sr-matches > summary::-webkit-details-marker, .sr-tf-details > summary::-webkit-details-marker, .sr-save summary::-webkit-details-marker { display: none; }
+.sr-scope > summary::before, .sr-stage > summary::before, .sr-matches > summary::before, .sr-tf-details > summary::before {
+  content: "\25B8"; color: var(--ink-faint); transition: transform .12s ease; }
+.sr-scope[open] > summary::before, .sr-stage[open] > summary::before, .sr-matches[open] > summary::before, .sr-tf-details[open] > summary::before { transform: rotate(90deg); }
+.sr-scope > summary { font-weight: 550; font-size: .9rem; }
+.sr-scope-body, .sr-models-body, .sr-save-body { margin-top: 10px; }
+.sr-stage-body { margin-top: 12px; }
+.sr-stage-title { font: 600 1rem var(--display); }
+
+.sr-checklist { display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow-y: auto; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--recessed); }
+.sr-checklist .check { align-items: flex-start; }
+.sr-checklist .check input { margin-top: 3px; flex: none; }
+.sr-desc { display: block; font-weight: 400; }
+
+.sr-models > summary { gap: 6px; }
+.sr-models > summary .btn { margin-left: auto; }
+.sr-model-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+
+/* Search */
+.sr-query-row { display: flex; gap: 8px; }
+.sr-query-row input { flex: 1 1 auto; min-width: 0; }
+@media (max-width: 600px) { .sr-query-row { flex-direction: column; } }
+.sr-options { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+.sr-fieldset { border: 0; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.sr-fieldset legend { font-weight: 550; font-size: .88rem; margin-bottom: 6px; padding: 0; }
+.sr-fieldset .check:has(input:disabled) { color: var(--ink-faint); cursor: not-allowed; }
+.sr-hit .item-title { font-size: .98rem; }
+.sr-matches { margin-top: 2px; }
+.sr-match { padding: 4px 0 4px 12px; border-left: 2px solid var(--line); margin: 6px 0 0 6px; color: var(--ink-soft); overflow-wrap: anywhere; }
+
+/* Ask output */
+.sr-ask-out:empty { display: none; }
+.sr-term { display: flex; gap: 10px; align-items: flex-start; }
+.sr-term .badge { margin-top: 2px; font-family: var(--mono); }
+.sr-answer { padding: 10px 12px; border-radius: var(--radius-sm); background: var(--recessed); font-size: .92rem; }
+.sr-final { border-color: var(--teal); }
+.sr-save { margin-top: 4px; }
+.sr-save summary { list-style: none; display: inline-flex; }
+
+/* Transformations */
+.sr-tf-card .card-title { overflow-wrap: anywhere; }
+.sr-dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 14px; margin: 10px 0 0; font-size: .9rem; }
+.sr-dl dt { color: var(--ink-faint); }
+.sr-dl dd { margin: 0; }
+@media (max-width: 600px) { .sr-dl { grid-template-columns: minmax(0, 1fr); } .sr-dl dd { margin-bottom: 6px; } }
+.sr-prompt { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--sunken); padding: 10px 12px; border-radius: var(--radius-sm); font-size: .85rem; }
+.sr-tall { min-height: 200px; }
+textarea.sr-mono { font-size: .88rem; }
+.sr-prompt-editor { min-height: 360px; }
+.sr-output { max-height: 480px; overflow-y: auto; }

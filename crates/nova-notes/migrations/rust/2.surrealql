@@ -1,0 +1,14 @@
+-- Rich note editor (BlockSuite). Additive and idempotent; the Python build
+-- ignores these fields and keeps using `content`.
+
+-- The editor's document: a base64 Yjs update.
+DEFINE FIELD IF NOT EXISTS doc_state ON TABLE note TYPE option<string>;
+-- SHA-256 (hex) of `content` when doc_state was saved. If `content` has been
+-- changed by something else since (the API, the Python build), the editor
+-- rebuilds the document from `content` instead of showing a stale one.
+DEFINE FIELD IF NOT EXISTS doc_hash ON TABLE note TYPE option<string>;
+-- "page" or "edgeless": the mode the note was last saved in.
+DEFINE FIELD IF NOT EXISTS doc_mode ON TABLE note TYPE option<string>;
+-- Notes this note links to (inline @ links and linked-note cards).
+DEFINE FIELD IF NOT EXISTS links ON TABLE note TYPE option<array<record<note>>>;
+DEFINE INDEX IF NOT EXISTS idx_note_links ON TABLE note COLUMNS links;

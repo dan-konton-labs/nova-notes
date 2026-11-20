@@ -1,0 +1,23 @@
+{
+  "name": "nova-notes-editor",
+  "private": true,
+  "version": "0.1.0",
+  "description": "The note editor (BlockSuite, AFFiNE's editor engine) bundled into static/editor/.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@blocksuite/affine-model": "0.19.5",
+    "@blocksuite/affine-shared": "0.19.5",
+    "@blocksuite/block-std": "0.19.5",
+    "@blocksuite/blocks": "0.19.5",
+    "@blocksuite/global": "0.19.5",
+    "@blocksuite/inline": "0.19.5",
+    "@blocksuite/presets": "0.19.5",
+    "@blocksuite/store": "0.19.5"
+  },
+  "devDependencies": {
+    "esbuild": "0.24.2"
+  }
+}

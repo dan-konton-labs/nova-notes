@@ -1,0 +1,6 @@
+/* The editor inside the Nova Notes note modal. The title lives in the
+   modal's own title field, so BlockSuite's in-doc title is hidden. */
+.nb-rich-surface affine-editor-container { display: block; height: 100%; }
+.nb-rich-surface doc-title { display: none; }
+.nb-rich-surface .affine-page-viewport { height: 100%; }
+.nb-rich-surface .playground-page-editor-container { padding-bottom: 48px; }
