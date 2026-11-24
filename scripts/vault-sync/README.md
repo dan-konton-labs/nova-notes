@@ -56,7 +56,61 @@ python3 nova_vault_sync.py --writer /opt/nova-vault-sync/writer --expect-db my_v
 
 Options: `--nova-url` (default `http://127.0.0.1:5055`), `--folder` (default `NovaNotes`), `--network` (docker
 network for the CLI container, default `host`), `--image`, `--case-sensitive` (only if the vault has "Handle
-files as case-sensitive" on), `--allow-unencrypted` (throwaway tests only).
+files as case-sensitive" on), `--allow-unencrypted` (throwaway tests only), `--token-file`,
+`--allow-insecure-http`.
+
+### Nova Notes with a password
+
+When Nova Notes has `OPEN_NOTEBOOK_PASSWORD` set, give the same password to this tool with
+`--token-file /etc/nova-vault-sync/nova-token`. The file contains just the password, not a `NAME=value` line.
+The tool sends it as a bearer header, never to a redirect target, and does not print it. The
+`NOVA_NOTES_TOKEN` environment variable is still supported for manual runs; use the file for systemd.
+
+`--nova-url` must be `https://`, or plain `http://` to a loopback address (127.0.0.1, ::1, localhost). For plain
+HTTP to another machine (inside a tailnet, where WireGuard already encrypts the traffic) pass
+`--allow-insecure-http`.
+
+If you run the service on a timer, install the optional credential drop-in **only** if Nova Notes
+requires a password. The base unit remains unchanged for unauthenticated installations.
+
+```bash
+sudo install -d -m 0700 /etc/nova-vault-sync
+sudo test -e /etc/nova-vault-sync/nova-token || sudo install -m 0600 /dev/null /etc/nova-vault-sync/nova-token
+sudo chown root:root /etc/nova-vault-sync/nova-token
+sudo chmod 0600 /etc/nova-vault-sync/nova-token
+sudoedit /etc/nova-vault-sync/nova-token   # enter the password only; do not put it in a shell command
+sudo install -D -m 0644 systemd/nova-vault-sync.service.d/credential.conf \
+  /etc/systemd/system/nova-vault-sync.service.d/credential.conf
+sudo systemctl daemon-reload
+```
+
+Keep the file outside `writer/` so it is not mounted into the LiveSync container. The drop-in replaces
+`ExecStart`, so carry over any custom arguments (such as `--expect-db` or a pinned `--image`) to the
+replacement line. Only the credential path appears in the unit and process arguments. Install this before enabling the timer. The next timer run uses the file; removing the drop-in and reloading systemd restores the base command.
+
+### Pinning the CLI image
+
+`novahq/livesync-cli:1.0.40` is a tag, and a tag can be re-pushed. The container sees the writer directory,
+which holds the vault passphrase and a decrypted copy of the vault, so run the exact image you have checked:
+
+```bash
+docker pull novahq/livesync-cli:1.0.40                       # if it comes from a registry
+docker image inspect --format '{{index .RepoDigests 0}}' novahq/livesync-cli:1.0.40
+# -> novahq/livesync-cli@sha256:<digest>; pass it as --image (or set DEFAULT_IMAGE)
+docker image inspect --format '{{.Id}}' novahq/livesync-cli:1.0.40
+# -> sha256:<id>, for an image that only exists locally; docker run accepts it as --image
+```
+
+The tool prints a warning on stderr while the image is not pinned. Use the same pinned reference for `IMG` in
+the setup commands above.
+
+### Why `--network host`
+
+The CLI container has to reach CouchDB at the address in the setup URI. On the lab host CouchDB listens on the
+host's loopback (`127.0.0.1:5984`), which a container on Docker's default bridge network cannot reach, so the
+default is `host`. If CouchDB has an address the bridge network can route to (a tailnet name, a LAN address, a
+Docker network shared with the CouchDB container), pass `--network bridge` (or that network's name) and use the
+same flag in the setup commands, so the container no longer shares the host's network stack.
 
 Output is one JSON line: `pushed`, `unchanged`, `conflicts`, `stale`, `overwritten`. Exit 0 = ran, 3 = a
 safety rule stopped it (the reason is in the JSON), 1 = unexpected error.

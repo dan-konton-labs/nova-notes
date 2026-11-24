@@ -8,6 +8,8 @@ use quick_xml::Reader;
 
 /// Deepest element nesting accepted; protects the recursive walkers.
 const MAX_DEPTH: usize = 512;
+/// Most elements accepted in one part; bounds the memory of the tree.
+const MAX_ELEMENTS: usize = 4_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct XmlNode {
@@ -116,15 +118,26 @@ pub(crate) fn parse(xml: &str) -> Result<XmlNode, String> {
         }
     }
 
+    let mut elements = 0usize;
+    let mut count_element = || {
+        elements += 1;
+        if elements > MAX_ELEMENTS {
+            Err("XML has too many elements".to_string())
+        } else {
+            Ok(())
+        }
+    };
     loop {
         match reader.read_event().map_err(|e| e.to_string())? {
             Event::Start(start) => {
                 if stack.len() > MAX_DEPTH {
                     return Err("XML is nested too deeply".to_string());
                 }
+                count_element()?;
                 stack.push(element(&start));
             }
             Event::Empty(start) => {
+                count_element()?;
                 let node = element(&start);
                 if let Some(top) = stack.last_mut() {
                     top.children.push(XmlChild::Element(node));
@@ -206,5 +219,13 @@ mod tests {
         assert!(parse("").is_err());
         assert!(parse("no markup").is_err());
         assert!(parse("</a>").is_err());
+    }
+
+    #[test]
+    fn element_count_is_capped() {
+        let flood = format!("<r>{}</r>", "<a/>".repeat(MAX_ELEMENTS));
+        assert_eq!(parse(&flood).unwrap_err(), "XML has too many elements");
+        let fits = format!("<r>{}</r>", "<a/>".repeat(1000));
+        assert_eq!(parse(&fits).unwrap().elements().count(), 1000);
     }
 }

@@ -109,11 +109,11 @@ async fn retry(State(state): State<AppState>, Path(episode_id): Path<String>) ->
 }
 
 async fn feed_url(State(state): State<AppState>, headers: HeaderMap) -> AppResult<Json<FeedUrl>> {
-    Ok(Json(podcast_feed::feed_url(&state, &forwarded_origin(&headers)).await?))
+    Ok(Json(podcast_feed::feed_url(&state, &forwarded_origin(&state.config, &headers)).await?))
 }
 
 async fn rotate_feed_token(State(state): State<AppState>, headers: HeaderMap) -> AppResult<Json<FeedUrl>> {
-    Ok(Json(podcast_feed::rotate_feed_url(&state, &forwarded_origin(&headers)).await?))
+    Ok(Json(podcast_feed::rotate_feed_url(&state, &forwarded_origin(&state.config, &headers)).await?))
 }
 
 #[cfg(test)]
@@ -178,7 +178,7 @@ mod tests {
 
     #[tokio::test]
     async fn generated_episode_end_to_end() {
-        let app = TestApp::new().await;
+        let app = crate::api::podcast_feed::tests::proxied_app().await;
         let tts = setup(&app).await;
         let job_id = generate(&app, "Offline first").await;
         assert_eq!(app.wait_for_job(&job_id).await, "completed");
@@ -404,6 +404,81 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    async fn command_count(app: &TestApp) -> usize {
+        app.state.db.query("SELECT id FROM command", crate::db::Params::new()).await.unwrap().len()
+    }
+
+    /// Issue #34: podcast content is stored in the job arguments and on the
+    /// episode, so it is capped well below the request body limit.
+    #[tokio::test]
+    async fn generation_refuses_overlong_content() {
+        let app = TestApp::new().await;
+        setup(&app).await;
+        let content = "a".repeat(crate::services::podcasts::MAX_PODCAST_CONTENT_CHARS + 1);
+        let (status, body) = app
+            .post(
+                "/api/podcasts/generate",
+                json!({ "episode_profile": "zz_show", "speaker_profile": "zz_speakers", "episode_name": "x", "content": content }),
+            )
+            .await;
+        assert_eq!(
+            (status, body["detail"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("The podcast content is too long (2,000,000 characters at most)."))
+        );
+        assert_eq!(command_count(&app).await, 0, "nothing was stored");
+    }
+
+    /// Issue #34: a full job queue answers 429 instead of growing without
+    /// bound, and a retry refused that way keeps the failed episode.
+    #[tokio::test]
+    async fn a_full_job_queue_is_a_429_and_a_refused_retry_keeps_the_episode() {
+        let app = TestApp::new().await;
+        setup(&app).await;
+        app.state.models.set_override(AnyModel::Language(MockLanguageModel::failing(AiError::Authentication(
+            "Invalid API key".into(),
+        ))));
+        let job_id = generate(&app, "Doomed").await;
+        assert_eq!(app.wait_for_job(&job_id).await, "failed");
+        let failed_id = only_episode(&app).await["id"].as_str().unwrap().to_string();
+        let commands = command_count(&app).await;
+
+        // One slow job fills a queue of one.
+        app.state.jobs.register("zz_hold", crate::jobs::RetryPolicy::once(), |_ctx, _args| async move {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok(Value::Null)
+        });
+        app.state.jobs.set_max_pending(1);
+        let hold = app.state.jobs.submit("zz_hold", Value::Null).await.unwrap();
+
+        let (status, body) = app
+            .post(
+                "/api/podcasts/generate",
+                json!({ "episode_profile": "zz_show", "speaker_profile": "zz_speakers", "episode_name": "y", "content": "c" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert!(body["detail"].as_str().unwrap().contains("Too many background jobs are queued"), "{body}");
+
+        let (status, _) = app.post(&format!("/api/podcasts/episodes/{failed_id}/retry"), json!({})).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let (status, _) = app.get(&format!("/api/podcasts/episodes/{failed_id}")).await;
+        assert_eq!(status, StatusCode::OK, "the failed episode is still there");
+        assert_eq!(command_count(&app).await, commands + 1, "refused submissions store no command row");
+
+        // Canceling the slow job frees its place.
+        assert!(app.state.jobs.cancel(&hold).await.unwrap());
+        for _ in 0..200 {
+            if app.state.jobs.pending() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        app.state.models.set_override(AnyModel::Language(MockLanguageModel::new([OUTLINE, TRANSCRIPT])));
+        let (status, body) = app.post(&format!("/api/podcasts/episodes/{failed_id}/retry"), json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(app.wait_for_job(body["job_id"].as_str().unwrap()).await, "completed");
+    }
+
     #[tokio::test]
     async fn audio_route_refusals_and_publish_rules() {
         let app = TestApp::new().await;
@@ -476,7 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn feed_url_and_token_rotation() {
-        let app = TestApp::new().await;
+        let app = crate::api::podcast_feed::tests::proxied_app().await;
         let (status, _, body) = read(&app, forwarded(Method::GET, "/api/podcasts/feed-url")).await;
         assert_eq!(status, StatusCode::OK);
         let url = serde_json::from_slice::<Value>(&body).unwrap()["feed_url"].as_str().unwrap().to_string();

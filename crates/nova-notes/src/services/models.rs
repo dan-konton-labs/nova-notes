@@ -18,8 +18,9 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::credentials::{
-    client_config, discover_with_config, existing_model_keys, process_env, truncate, validate_config_urls, EnvLookup,
+    credential_provider, discover_with_config, existing_model_keys, process_env, provider_mismatch, truncate, EnvLookup,
 };
+use crate::ai::net::prepare_client_config;
 use crate::domain::credential::resolve_provider_config_with;
 use crate::domain::model::{all_models_by_provider, auto_assign_required, is_valid_model_type, MODEL_TYPES};
 use crate::domain::{Credential, DefaultModels, Model};
@@ -217,6 +218,15 @@ pub async fn create_model(state: &AppState, input: &NewModel) -> AppResult<Model
     if !is_valid_model_type(&input.model_type) {
         return Err(AppError::bad_request(invalid_type_message()));
     }
+    // A model sends its credential's key to the model's provider: the two
+    // must match.
+    if let Some(credential) = input.credential.as_deref().filter(|c| !c.is_empty()) {
+        if let Some(provider) = credential_provider(state, credential).await.map_err(with_context("Error creating model"))? {
+            if provider != nn_ai::normalize_provider_name(&input.provider) {
+                return Err(provider_mismatch(&provider, &input.provider));
+            }
+        }
+    }
     let result = async {
         if Model::find_duplicate(state, &input.provider, &input.name, &input.model_type).await?.is_some() {
             return Err(AppError::bad_request(format!(
@@ -257,11 +267,9 @@ pub async fn delete_model(state: &AppState, id: &str) -> AppResult<()> {
 /// The client configuration a model runs with (its credential, else the
 /// provider default credential, else the environment), URLs re-validated.
 async fn model_client_config(state: &AppState, model: &Model) -> AppResult<nn_ai::ProviderConfig> {
-    let config = client_config(model.provider_config(state).await?.map(|(config, _source)| config));
-    validate_config_urls(&config)
+    prepare_client_config(&state.config.providers, &model.provider, model.provider_config(state).await?)
         .await
-        .map_err(|e| AppError::config(format!("The endpoint configured for {} is not allowed: {e}", model.provider)))?;
-    Ok(config)
+        .map_err(|e| AppError::config(format!("The endpoint configured for {} is not allowed: {e}", model.provider)))
 }
 
 /// Test one model end to end with a real call. Missing → 404; every other
@@ -528,9 +536,14 @@ pub async fn discover_provider_models_with(
         return Ok(Vec::new());
     }
     let resolved = resolve_provider_config_with(state, provider, |name| env(name)).await?;
-    let config = client_config(resolved.map(|(config, _source)| config));
-    Ok(discover_with_config(state, provider, &config)
-        .await
+    let discovered = match prepare_client_config(&state.config.providers, provider, resolved).await {
+        Ok(config) => discover_with_config(state, provider, &config).await,
+        Err(e) => {
+            tracing::warn!("Failed to discover {provider} models: {e}");
+            Vec::new()
+        }
+    };
+    Ok(discovered
         .into_iter()
         .map(|m| DiscoveredModelInfo {
             name: m.name,

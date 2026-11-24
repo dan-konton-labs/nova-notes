@@ -17,13 +17,42 @@
 //! It does not run JavaScript: pages rendered client-side come out empty or
 //! partial, which is what the remote engines are for.
 
+use std::borrow::Cow;
+use std::cell::{Cell, Ref, RefCell};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use ego_tree::iter::Edge;
+use ego_tree::NodeId;
+use html5ever::tendril::{StrTendril, TendrilSink};
+use html5ever::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
+use html5ever::{Attribute, QualName};
 use regex::Regex;
-use scraper::{ElementRef, Html, Node, Selector};
+use scraper::{ElementRef, Html, HtmlTreeSink, Node, Selector};
 use url::Url;
 
 use super::markdown;
+use crate::error::ContentError;
+
+// Limits that keep a hostile page from crashing or stalling the server.
+
+/// Largest HTML input converted; anything after this many bytes is ignored.
+/// Real article pages are well under 2 MB.
+pub(crate) const MAX_HTML_BYTES: usize = 5 * 1024 * 1024;
+/// Deepest element nesting the parser is allowed to build. html5ever does a
+/// linear scan of its open-element stack for many start tags, so an
+/// unbounded stack makes parsing quadratic. Parsing stops at this depth and
+/// the rest of the document is dropped.
+const MAX_PARSE_DEPTH: usize = 512;
+/// Most elements the parser may create (bounds memory, including elements
+/// html5ever re-creates on its own while reconstructing formatting).
+const MAX_PARSE_ELEMENTS: usize = 2_000_000;
+/// Input is fed to the parser in slices of about this size so the limits
+/// above are checked often.
+const PARSE_CHUNK_BYTES: usize = 8 * 1024;
+/// Deepest recursion of the Markdown renderer (each element level takes one
+/// or two frames). Content below it is kept as plain text.
+const MAX_RENDER_DEPTH: usize = 256;
 
 /// Conversion settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,13 +86,20 @@ pub struct HtmlPage {
 }
 
 /// Convert an HTML document or fragment to Markdown.
+///
+/// Bounded for hostile input: at most [`MAX_HTML_BYTES`] are read, parsing
+/// stops at a nesting depth of [`MAX_PARSE_DEPTH`], every walk over the tree
+/// is either iterative or depth-limited, and per-element facts are computed
+/// once so the work is linear in the size of the document. This is CPU-bound;
+/// async callers use [`html_to_markdown_blocking`].
 pub fn html_to_markdown(html: &str, options: &HtmlOptions) -> HtmlPage {
-    let document = Html::parse_document(html);
+    let document = parse_limited(html);
+    let facts = element_facts(&document);
     let base = effective_base(&document, options.base_url.as_ref());
-    let converter = Converter { base: base.as_ref(), prune: options.main_content };
+    let converter = Converter { base: base.as_ref(), prune: options.main_content, facts: &facts, depth: Cell::new(0) };
 
     let body = select_first(&document, "body").unwrap_or_else(|| document.root_element());
-    let root = if options.main_content { main_content_root(&document, body) } else { body };
+    let root = if options.main_content { main_content_root(&document, body, &facts) } else { body };
 
     let mut blocks = Vec::new();
     converter.render_children(root, &mut blocks);
@@ -90,6 +126,284 @@ pub fn html_to_markdown(html: &str, options: &HtmlOptions) -> HtmlPage {
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty()),
         site_name: meta_content(&document, &["og:site_name", "application-name"]),
+    }
+}
+
+/// [`html_to_markdown`] on a blocking thread, behind the shared limit on
+/// concurrent parsing jobs, for use from async code.
+pub(crate) async fn html_to_markdown_blocking(html: String, options: HtmlOptions) -> Result<HtmlPage, ContentError> {
+    super::files::run_blocking(move || Ok(html_to_markdown(&html, &options))).await
+}
+
+/// Parse `html` like [`Html::parse_document`], within the parse limits.
+fn parse_limited(html: &str) -> Html {
+    let html = truncate_at_char_boundary(html, MAX_HTML_BYTES);
+    let sink = LimitedSink {
+        inner: HtmlTreeSink::new(Html::new_document()),
+        depths: RefCell::new(HashMap::new()),
+        elements: Cell::new(0),
+        exceeded: Cell::new(false),
+    };
+    let mut parser = html5ever::parse_document(sink, Default::default());
+    let mut rest = html;
+    while !rest.is_empty() {
+        let chunk = truncate_at_char_boundary(rest, PARSE_CHUNK_BYTES);
+        parser.process(StrTendril::from_slice(chunk));
+        rest = &rest[chunk.len()..];
+        if parser.tokenizer.sink.sink.exceeded.get() {
+            tracing::warn!(
+                "HTML nests deeper than {MAX_PARSE_DEPTH} levels or has more than {MAX_PARSE_ELEMENTS} elements; \
+                 the rest of the document is ignored"
+            );
+            break;
+        }
+    }
+    parser.finish()
+}
+
+/// At most `max` bytes of `text`. A cut ends just before a `<` when there
+/// is one, so the parser is not left holding half a tag (which it would
+/// output as text if parsing stops there).
+fn truncate_at_char_boundary(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    match text[..end].rfind('<') {
+        Some(tag) if tag > 0 => &text[..tag],
+        _ if end == 0 => &text[..text.ceil_char_boundary(1)],
+        _ => &text[..end],
+    }
+}
+
+/// scraper's tree sink, plus a record of how deep each element sits and how
+/// many elements exist, so parsing can stop before html5ever's own work on a
+/// deep tree becomes quadratic.
+struct LimitedSink {
+    inner: HtmlTreeSink,
+    /// Depth of elements seen so far (missing entries are recomputed).
+    depths: RefCell<HashMap<NodeId, usize>>,
+    elements: Cell<usize>,
+    exceeded: Cell<bool>,
+}
+
+impl LimitedSink {
+    fn depth_of(&self, id: NodeId) -> usize {
+        if let Some(depth) = self.depths.borrow().get(&id) {
+            return *depth;
+        }
+        let html = self.inner.0.borrow();
+        let depth = html.tree.get(id).map_or(0, |node| node.ancestors().take(MAX_PARSE_DEPTH + 1).count());
+        drop(html);
+        self.depths.borrow_mut().insert(id, depth);
+        depth
+    }
+
+    fn placed(&self, parent: NodeId, child: &NodeOrText<NodeId>) {
+        if let NodeOrText::AppendNode(child) = child {
+            let depth = self.depth_of(parent) + 1;
+            self.depths.borrow_mut().insert(*child, depth);
+            if depth > MAX_PARSE_DEPTH {
+                self.exceeded.set(true);
+            }
+        }
+    }
+}
+
+impl TreeSink for LimitedSink {
+    type Output = Html;
+    type Handle = NodeId;
+    type ElemName<'a> = Ref<'a, QualName>;
+
+    fn finish(self) -> Html {
+        self.inner.finish()
+    }
+    fn parse_error(&self, msg: Cow<'static, str>) {
+        self.inner.parse_error(msg);
+    }
+    fn get_document(&self) -> NodeId {
+        self.inner.get_document()
+    }
+    fn elem_name<'a>(&'a self, target: &'a NodeId) -> Ref<'a, QualName> {
+        self.inner.elem_name(target)
+    }
+    fn create_element(&self, name: QualName, attrs: Vec<Attribute>, flags: ElementFlags) -> NodeId {
+        let count = self.elements.get() + 1;
+        self.elements.set(count);
+        if count > MAX_PARSE_ELEMENTS {
+            self.exceeded.set(true);
+        }
+        self.inner.create_element(name, attrs, flags)
+    }
+    fn create_comment(&self, text: StrTendril) -> NodeId {
+        self.inner.create_comment(text)
+    }
+    fn create_pi(&self, target: StrTendril, data: StrTendril) -> NodeId {
+        self.inner.create_pi(target, data)
+    }
+    fn append(&self, parent: &NodeId, child: NodeOrText<NodeId>) {
+        self.placed(*parent, &child);
+        self.inner.append(parent, child);
+    }
+    fn append_based_on_parent_node(&self, element: &NodeId, prev_element: &NodeId, child: NodeOrText<NodeId>) {
+        let has_parent = self.inner.0.borrow().tree.get(*element).and_then(|node| node.parent()).is_some();
+        if has_parent {
+            self.append_before_sibling(element, child);
+        } else {
+            self.append(prev_element, child);
+        }
+    }
+    fn append_doctype_to_document(&self, name: StrTendril, public_id: StrTendril, system_id: StrTendril) {
+        self.inner.append_doctype_to_document(name, public_id, system_id);
+    }
+    fn mark_script_already_started(&self, node: &NodeId) {
+        self.inner.mark_script_already_started(node);
+    }
+    fn pop(&self, node: &NodeId) {
+        self.inner.pop(node);
+    }
+    fn get_template_contents(&self, target: &NodeId) -> NodeId {
+        self.inner.get_template_contents(target)
+    }
+    fn same_node(&self, x: &NodeId, y: &NodeId) -> bool {
+        self.inner.same_node(x, y)
+    }
+    fn set_quirks_mode(&self, mode: QuirksMode) {
+        self.inner.set_quirks_mode(mode);
+    }
+    fn append_before_sibling(&self, sibling: &NodeId, new_node: NodeOrText<NodeId>) {
+        let parent = self.inner.0.borrow().tree.get(*sibling).and_then(|node| node.parent()).map(|p| p.id());
+        if let Some(parent) = parent {
+            self.placed(parent, &new_node);
+        }
+        self.inner.append_before_sibling(sibling, new_node);
+    }
+    fn add_attrs_if_missing(&self, target: &NodeId, attrs: Vec<Attribute>) {
+        self.inner.add_attrs_if_missing(target, attrs);
+    }
+    fn associate_with_form(&self, target: &NodeId, form: &NodeId, nodes: (&NodeId, Option<&NodeId>)) {
+        self.inner.associate_with_form(target, form, nodes);
+    }
+    fn remove_from_parent(&self, target: &NodeId) {
+        self.depths.borrow_mut().remove(target);
+        self.inner.remove_from_parent(target);
+    }
+    fn reparent_children(&self, node: &NodeId, new_parent: &NodeId) {
+        // The moved children get a new depth; recompute it when next needed.
+        let children: Vec<NodeId> =
+            self.inner.0.borrow().tree.get(*node).map(|n| n.children().map(|c| c.id()).collect()).unwrap_or_default();
+        {
+            let mut depths = self.depths.borrow_mut();
+            for child in children {
+                depths.remove(&child);
+            }
+        }
+        self.inner.reparent_children(node, new_parent);
+    }
+    fn is_mathml_annotation_xml_integration_point(&self, handle: &NodeId) -> bool {
+        self.inner.is_mathml_annotation_xml_integration_point(handle)
+    }
+    fn set_current_line(&self, line_number: u64) {
+        self.inner.set_current_line(line_number);
+    }
+    fn allow_declarative_shadow_roots(&self, intended_parent: &NodeId) -> bool {
+        self.inner.allow_declarative_shadow_roots(intended_parent)
+    }
+    fn attach_declarative_shadow(&self, location: &NodeId, template: &NodeId, attrs: &[Attribute]) -> bool {
+        self.inner.attach_declarative_shadow(location, template, attrs)
+    }
+    fn maybe_clone_an_option_into_selectedcontent(&self, option: &NodeId) {
+        self.inner.maybe_clone_an_option_into_selectedcontent(option);
+    }
+}
+
+/// Facts about an element's subtree that the converter asks for repeatedly.
+/// Computed for every element in one bottom-up pass, so asking is O(1)
+/// instead of a walk over the subtree each time.
+#[derive(Debug, Clone, Copy, Default)]
+struct Facts {
+    /// Length of the text a reader would see under the element.
+    visible_text_len: usize,
+    /// Some descendant (not the element itself) is a block element.
+    has_block: bool,
+    /// Some descendant is a `<nav>`.
+    has_nav: bool,
+    /// Some descendant is a `<table>`.
+    has_table: bool,
+    /// Whether the first text node under the element starts with whitespace
+    /// (`None` when it has no text at all).
+    leading_space: Option<bool>,
+}
+
+type FactTable = HashMap<NodeId, Facts>;
+
+fn element_facts(document: &Html) -> FactTable {
+    let mut table: FactTable = HashMap::new();
+    for edge in document.tree.root().traverse() {
+        let Edge::Close(node) = edge else { continue };
+        if !matches!(node.value(), Node::Element(_) | Node::Document | Node::Fragment) {
+            continue;
+        }
+        let mut facts = Facts::default();
+        for child in node.children() {
+            match child.value() {
+                Node::Text(text) => {
+                    facts.visible_text_len += text.trim().len();
+                    if facts.leading_space.is_none() {
+                        facts.leading_space = Some(text.starts_with(char::is_whitespace));
+                    }
+                }
+                Node::Element(el) => {
+                    let name = el.name();
+                    let child_facts = table.get(&child.id()).copied().unwrap_or_default();
+                    if !is_non_content(name) {
+                        facts.visible_text_len += child_facts.visible_text_len;
+                    }
+                    facts.has_block |= is_block(name) || child_facts.has_block;
+                    facts.has_nav |= name == "nav" || child_facts.has_nav;
+                    facts.has_table |= name == "table" || child_facts.has_table;
+                    if facts.leading_space.is_none() {
+                        facts.leading_space = child_facts.leading_space;
+                    }
+                }
+                _ => {}
+            }
+        }
+        table.insert(node.id(), facts);
+    }
+    table
+}
+
+fn facts_of(table: &FactTable, element: ElementRef) -> Facts {
+    table.get(&element.id()).copied().unwrap_or_default()
+}
+
+/// Text a reader would see under `element`, in document order, without
+/// recursion. Used where the renderer stops descending.
+fn flat_text(element: ElementRef, out: &mut String) {
+    let mut skipping: Option<NodeId> = None;
+    for edge in element.traverse().skip(1) {
+        match edge {
+            Edge::Open(node) => {
+                if skipping.is_some() {
+                    continue;
+                }
+                match node.value() {
+                    Node::Text(text) => push_text(out, text),
+                    Node::Element(el) if is_non_content(el.name()) => skipping = Some(node.id()),
+                    Node::Element(el) if is_block(el.name()) => push_text(out, " "),
+                    _ => {}
+                }
+            }
+            Edge::Close(node) => {
+                if skipping == Some(node.id()) {
+                    skipping = None;
+                }
+            }
+        }
     }
 }
 
@@ -213,28 +527,11 @@ fn is_block(name: &str) -> bool {
     )
 }
 
-/// Length of the text a reader would see under `element`.
-fn visible_text_len(element: ElementRef) -> usize {
-    let mut total = 0;
-    for child in element.children() {
-        match child.value() {
-            Node::Text(text) => total += text.trim().len(),
-            Node::Element(el) if !is_non_content(el.name()) => {
-                if let Some(child) = ElementRef::wrap(child) {
-                    total += visible_text_len(child);
-                }
-            }
-            _ => {}
-        }
-    }
-    total
-}
-
 /// Pick the element that holds the article: the smallest well-known content
 /// container that still carries most of the text of the largest one. Falls
 /// back to `body` when no container holds a substantial share of the page
 /// (index pages, pages without semantic markup).
-fn main_content_root<'a>(document: &'a Html, body: ElementRef<'a>) -> ElementRef<'a> {
+fn main_content_root<'a>(document: &'a Html, body: ElementRef<'a>, facts: &FactTable) -> ElementRef<'a> {
     static CANDIDATES: OnceLock<Selector> = OnceLock::new();
     let selector = CANDIDATES.get_or_init(|| {
         Selector::parse(
@@ -245,6 +542,7 @@ fn main_content_root<'a>(document: &'a Html, body: ElementRef<'a>) -> ElementRef
         .expect("valid selector")
     });
 
+    let visible_text_len = |element: ElementRef| facts_of(facts, element).visible_text_len;
     let body_len = visible_text_len(body);
     let floor = 250.max(body_len / 4);
     let candidates: Vec<(ElementRef, usize)> =
@@ -283,9 +581,43 @@ fn chrome_token_pattern() -> &'static Regex {
 struct Converter<'a> {
     base: Option<&'a Url>,
     prune: bool,
+    facts: &'a FactTable,
+    /// Current recursion depth of the render functions.
+    depth: Cell<usize>,
+}
+
+/// Holds one level of render depth; gives it back when dropped.
+struct DepthGuard<'a>(&'a Cell<usize>);
+
+impl Drop for DepthGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
 }
 
 impl Converter<'_> {
+    /// Take one level of render depth, or `None` when the limit is reached
+    /// and the caller must fall back to flat text.
+    fn descend(&self) -> Option<DepthGuard<'_>> {
+        let depth = self.depth.get();
+        if depth >= MAX_RENDER_DEPTH {
+            return None;
+        }
+        self.depth.set(depth + 1);
+        Some(DepthGuard(&self.depth))
+    }
+
+    fn facts(&self, element: ElementRef) -> Facts {
+        facts_of(self.facts, element)
+    }
+
+    /// Block-level fallback below the depth limit: the element's text as one block.
+    fn flat_block(element: ElementRef, blocks: &mut Vec<String>) {
+        let mut inline = String::new();
+        flat_text(element, &mut inline);
+        flush_inline(&mut inline, blocks);
+    }
+
     fn skip(&self, element: ElementRef) -> bool {
         let el = element.value();
         let name = el.name();
@@ -308,15 +640,13 @@ impl Converter<'_> {
         match name {
             "nav" | "aside" | "footer" => return true,
             "header" => {
-                static NAV: OnceLock<Selector> = OnceLock::new();
-                let nav = NAV.get_or_init(|| Selector::parse("nav").expect("valid selector"));
-                if element.select(nav).next().is_some() {
+                if self.facts(element).has_nav {
                     return true;
                 }
             }
             // Search, login and newsletter forms are short; some sites wrap
             // the whole page in one form, which must survive.
-            "form" if visible_text_len(element) < 2000 => return true,
+            "form" if self.facts(element).visible_text_len < 2000 => return true,
             _ => {}
         }
         if let Some(role) = el.attr("role") {
@@ -342,6 +672,9 @@ impl Converter<'_> {
 
     /// Render the children of `parent` as a sequence of Markdown blocks.
     fn render_children(&self, parent: ElementRef, blocks: &mut Vec<String>) {
+        let Some(_depth) = self.descend() else {
+            return Self::flat_block(parent, blocks);
+        };
         let mut inline = String::new();
         for child in parent.children() {
             match child.value() {
@@ -355,7 +688,7 @@ impl Converter<'_> {
                     if is_block(name) {
                         flush_inline(&mut inline, blocks);
                         self.render_block(element, blocks);
-                    } else if contains_block(element) {
+                    } else if self.facts(element).has_block {
                         flush_inline(&mut inline, blocks);
                         self.render_children(element, blocks);
                     } else {
@@ -369,6 +702,9 @@ impl Converter<'_> {
     }
 
     fn render_block(&self, element: ElementRef, blocks: &mut Vec<String>) {
+        let Some(_depth) = self.descend() else {
+            return Self::flat_block(element, blocks);
+        };
         let name = element.value().name();
         match name {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
@@ -379,7 +715,7 @@ impl Converter<'_> {
                 }
             }
             "p" | "summary" | "figcaption" | "caption" | "address" => {
-                if contains_block(element) {
+                if self.facts(element).has_block {
                     self.render_children(element, blocks);
                 } else {
                     let mut inline = String::new();
@@ -483,8 +819,6 @@ impl Converter<'_> {
             }
         }
 
-        static NESTED: OnceLock<Selector> = OnceLock::new();
-        let nested = NESTED.get_or_init(|| Selector::parse("table").expect("valid selector"));
         fn cells_of<'a>(row: ElementRef<'a>) -> Vec<ElementRef<'a>> {
             row.child_elements().filter(|c| matches!(c.value().name(), "td" | "th")).collect()
         }
@@ -492,7 +826,7 @@ impl Converter<'_> {
 
         // Tables used for page layout (nested tables, a single column) read
         // better as plain blocks than as a grid.
-        if widest <= 1 || table.select(nested).next().is_some() {
+        if widest <= 1 || self.facts(table).has_table {
             if let Some(caption) = caption {
                 blocks.push(caption);
             }
@@ -542,6 +876,9 @@ impl Converter<'_> {
     }
 
     fn inline_children(&self, parent: ElementRef, out: &mut String, plain: bool) {
+        let Some(_depth) = self.descend() else {
+            return flat_text(parent, out);
+        };
         for child in parent.children() {
             match child.value() {
                 Node::Text(text) => push_text(out, text),
@@ -558,6 +895,9 @@ impl Converter<'_> {
     }
 
     fn render_inline(&self, element: ElementRef, out: &mut String, plain: bool) {
+        let Some(_depth) = self.descend() else {
+            return flat_text(element, out);
+        };
         let name = element.value().name();
         match name {
             "br" => {
@@ -579,7 +919,7 @@ impl Converter<'_> {
             "a" => {
                 let mut inner = String::new();
                 self.inline_children(element, &mut inner, plain);
-                let (lead, trail) = (leading_space(element), inner.ends_with(' '));
+                let (lead, trail) = (self.leading_space(element), inner.ends_with(' '));
                 let text = inner.trim();
                 if text.is_empty() {
                     return;
@@ -617,7 +957,7 @@ impl Converter<'_> {
             "q" => {
                 let mut inner = String::new();
                 self.inline_children(element, &mut inner, plain);
-                let (lead, trail) = (leading_space(element), inner.ends_with(' '));
+                let (lead, trail) = (self.leading_space(element), inner.ends_with(' '));
                 if !inner.trim().is_empty() {
                     push_spaced(out, &format!("\"{}\"", inner.trim()), lead, trail);
                 }
@@ -640,7 +980,7 @@ impl Converter<'_> {
     fn wrapped(&self, element: ElementRef, out: &mut String, marker: &str, plain: bool) {
         let mut inner = String::new();
         self.inline_children(element, &mut inner, plain);
-        let (lead, trail) = (leading_space(element), inner.ends_with(' '));
+        let (lead, trail) = (self.leading_space(element), inner.ends_with(' '));
         let text = inner.trim();
         if text.is_empty() {
             return;
@@ -650,6 +990,12 @@ impl Converter<'_> {
         } else {
             push_spaced(out, &format!("{marker}{text}{marker}"), lead, trail);
         }
+    }
+
+    /// Whether the first text inside `element` starts with whitespace. The
+    /// inline buffer cannot tell: it never starts with a space.
+    fn leading_space(&self, element: ElementRef) -> bool {
+        self.facts(element).leading_space.unwrap_or(false)
     }
 
     /// Absolute form of a link target. `None` for targets that are not
@@ -671,10 +1017,6 @@ impl Converter<'_> {
     }
 }
 
-fn contains_block(element: ElementRef) -> bool {
-    element.descendent_elements().skip(1).any(|d| is_block(d.value().name()))
-}
-
 /// Append text in HTML's collapsed-whitespace sense.
 fn push_text(out: &mut String, text: &str) {
     for c in text.chars() {
@@ -686,12 +1028,6 @@ fn push_text(out: &mut String, text: &str) {
             out.push(c);
         }
     }
-}
-
-/// Whether the first text inside `element` starts with whitespace. The
-/// inline buffer cannot tell: it never starts with a space.
-fn leading_space(element: ElementRef) -> bool {
-    element.text().next().is_some_and(|t| t.starts_with(char::is_whitespace))
 }
 
 /// Append an already-formatted inline fragment, restoring the spaces that
@@ -722,21 +1058,31 @@ fn flush_inline(inline: &mut String, blocks: &mut Vec<String>) {
     inline.clear();
 }
 
-/// Text of a `<pre>` as written, with `<br>` as line breaks.
+/// Text of a `<pre>` as written, with `<br>` as line breaks. Iterative, so
+/// any nesting depth is safe.
 fn raw_text(element: ElementRef, out: &mut String) {
-    for child in element.children() {
-        match child.value() {
-            Node::Text(text) => out.push_str(text),
-            Node::Element(el) => {
-                if el.name() == "br" {
-                    out.push('\n');
-                } else if !is_non_content(el.name()) {
-                    if let Some(child) = ElementRef::wrap(child) {
-                        raw_text(child, out);
+    let mut skipping: Option<NodeId> = None;
+    for edge in element.traverse().skip(1) {
+        match edge {
+            Edge::Open(node) => {
+                if skipping.is_some() {
+                    continue;
+                }
+                match node.value() {
+                    Node::Text(text) => out.push_str(text),
+                    Node::Element(el) if el.name() == "br" => {
+                        out.push('\n');
+                        skipping = Some(node.id());
                     }
+                    Node::Element(el) if is_non_content(el.name()) => skipping = Some(node.id()),
+                    _ => {}
                 }
             }
-            _ => {}
+            Edge::Close(node) => {
+                if skipping == Some(node.id()) {
+                    skipping = None;
+                }
+            }
         }
     }
 }
@@ -757,7 +1103,7 @@ fn code_language(element: ElementRef) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn convert(html: &str) -> String {
@@ -1005,6 +1351,56 @@ Figure 1: a tide.
         assert!(markdown.contains("Meaningful sentence"));
         assert!(!markdown.contains("Email"));
         assert!(!markdown.contains("state"));
+    }
+
+    /// `<tag>` nested `depth` times around `inner`.
+    pub(crate) fn nested(tag: &str, depth: usize, inner: &str) -> String {
+        let mut html = String::with_capacity(depth * (tag.len() * 2 + 5) + inner.len());
+        for _ in 0..depth {
+            html.push('<');
+            html.push_str(tag);
+            html.push('>');
+        }
+        html.push_str(inner);
+        for _ in 0..depth {
+            html.push_str("</");
+            html.push_str(tag);
+            html.push('>');
+        }
+        html
+    }
+
+    /// Run `work` on a thread with a deliberately small stack (1 MiB, half of
+    /// Rust's and tokio's default, in an unoptimised build whose frames are
+    /// several times larger than release ones), so unbounded recursion fails
+    /// the test instead of passing on a big main-thread stack.
+    fn on_small_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new().stack_size(1024 * 1024).spawn(work).unwrap().join().expect("conversion crashed")
+    }
+
+    #[test]
+    fn nesting_below_the_parse_limit_keeps_its_text() {
+        // Deeper than the renderer recurses, shallower than the parser stops:
+        // the innermost content comes out as plain text instead of vanishing.
+        for tag in ["div", "span", "em", "blockquote"] {
+            let html = format!("<body>{}</body>", nested(tag, MAX_PARSE_DEPTH - 20, "deep <b>words</b> here"));
+            let page = on_small_stack(move || html_to_markdown(&html, &HtmlOptions::default()));
+            assert!(page.markdown.contains("deep words here"), "{tag}: {}", page.markdown);
+        }
+        let pre = format!("<pre>{}</pre>", nested("span", MAX_PARSE_DEPTH - 20, "line 1<br>line 2"));
+        assert_eq!(convert(&pre), "```\nline 1\nline 2\n```");
+    }
+
+    #[test]
+    fn oversized_input_is_cut_at_the_size_limit() {
+        let filler = "<p>filler words</p>".repeat(MAX_HTML_BYTES / 19 + 10);
+        let html = format!("<body><p>start</p>{filler}<p>after the limit</p></body>");
+        let page = on_small_stack(move || html_to_markdown(&html, &HtmlOptions { base_url: None, main_content: false }));
+        assert!(page.markdown.starts_with("start"));
+        assert!(!page.markdown.contains("after the limit"));
+        assert_eq!(truncate_at_char_boundary("aé", 2), "a");
+        assert_eq!(truncate_at_char_boundary("<p>a<b>c", 6), "<p>a");
+        assert_eq!(truncate_at_char_boundary("é", 1), "é");
     }
 
     #[test]

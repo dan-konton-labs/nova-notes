@@ -14,6 +14,8 @@
 //! once an override is set for a model type, every request for that type
 //! returns it, whatever the database says.
 
+pub mod net;
+
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -105,21 +107,13 @@ impl ModelManager {
         if let Some(model) = self.overridden(&model.model_type) {
             return Ok(model);
         }
-        let mut config: nn_ai::ProviderConfig = match model.provider_config(state).await? {
-            Some((resolved, _source)) => resolved.into(),
-            None => nn_ai::ProviderConfig::default(),
-        };
-        // User-supplied endpoints are checked again at use time: DNS may have
-        // changed since the credential was saved. Local addresses stay
-        // allowed, as in the Python build (self-hosted Ollama and friends).
-        for url in [&config.base_url, &config.endpoint, &config.endpoint_llm, &config.endpoint_embedding, &config.endpoint_stt, &config.endpoint_tts]
-            .into_iter()
-            .flatten()
-        {
-            nn_content::validate_url(url)
-                .await
-                .map_err(|e| AppError::config(format!("The endpoint configured for {} is not allowed: {e}", model.provider)))?;
-        }
+        // Stored URLs and files are checked again at use time (see `net`):
+        // DNS may have changed since the credential was saved, and rows
+        // written before these checks existed are covered too. Local
+        // addresses stay allowed by default (self-hosted Ollama and friends).
+        let mut config = net::prepare_client_config(&self.config.providers, &model.provider, model.provider_config(state).await?)
+            .await
+            .map_err(|e| AppError::config(format!("The endpoint configured for {} is not allowed: {e}", model.provider)))?;
         if config.timeout.is_none() && model.model_type == "language" {
             config.timeout = Some(self.config.llm_timeout);
         }

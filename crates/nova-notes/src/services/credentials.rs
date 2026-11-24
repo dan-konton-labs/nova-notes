@@ -17,12 +17,14 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Map;
 
+use crate::ai::net;
 use crate::crypto::{self, Cipher, Reencrypt, SecretString};
 use crate::db::{table_of, with_table, Doc, Json, Params};
 use crate::domain::credential::{
     check_required_fields, credential_from_env, default_modalities, is_supported_provider,
 };
-use crate::domain::{Credential, Model, ResolvedProviderConfig};
+use crate::domain::credential::ConfigSource;
+use crate::domain::{Credential, Model};
 use crate::error::{AppError, AppResult};
 use crate::jobs::JobQueue;
 use crate::services::notebooks::timestamp;
@@ -67,56 +69,76 @@ pub(crate) fn mask(detail: &'static str) -> impl Fn(AppError) -> AppError {
     }
 }
 
-/// `validate_url` as the credential endpoints call it: an empty value
-/// passes; a rejected URL is a 400 with the validator's message.
-pub(crate) async fn check_url(url: &str) -> AppResult<()> {
-    if url.trim().is_empty() {
-        return Ok(());
-    }
-    nn_content::validate_url(url.trim())
+/// `validate_url` (under the configured provider URL policy) as the
+/// credential endpoints call it: an empty value passes; a rejected URL is a
+/// 400 with the validator's message.
+pub(crate) async fn check_url(state: &AppState, url: &str) -> AppResult<()> {
+    let config = nn_ai::ProviderConfig { base_url: Some(url.to_string()), ..nn_ai::ProviderConfig::default() };
+    net::validate_config_urls(&config, &state.config.providers.url_policy)
         .await
-        .map_err(|e| AppError::bad_request(truncate(&e.to_string(), 200)))
+        .map_err(|e| AppError::bad_request(truncate(&e, 200)))
 }
 
-/// Check every URL of a client configuration right before a request (the
-/// Python build pins and validates user-supplied URLs at request time).
-pub(crate) async fn validate_config_urls(config: &nn_ai::ProviderConfig) -> Result<(), String> {
-    for url in [
-        &config.base_url,
-        &config.endpoint,
-        &config.endpoint_llm,
-        &config.endpoint_embedding,
-        &config.endpoint_stt,
-        &config.endpoint_tts,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if url.trim().is_empty() {
-            continue;
+/// What a credential may point at, checked when it is saved: a first-party
+/// provider's base URL must be on its own domain, and a Vertex AI credential
+/// takes no base URL, a plain region name and a service-account file inside
+/// the configured directories. A violation is a 400. The same rules are
+/// applied again at use time ([`net::prepare_client_config`]).
+fn check_targets(state: &AppState, credential: &Credential) -> AppResult<()> {
+    let net_config = &state.config.providers;
+    let provider = credential.provider.to_lowercase();
+    if let Some(problem) = credential.base_url.as_deref().and_then(|url| net::base_url_problem(net_config, &provider, url)) {
+        return Err(AppError::bad_request(problem));
+    }
+    if provider == "vertex" {
+        if let Some(location) = &credential.location {
+            net::check_vertex_location(location).map_err(AppError::bad_request)?;
         }
-        nn_content::validate_url(url.trim()).await.map_err(|e| e.to_string())?;
+        if let Some(path) = credential.credentials_path.as_deref().filter(|p| !p.trim().is_empty()) {
+            net::confine_vertex_credentials(net_config, path).map_err(AppError::bad_request)?;
+        }
     }
     Ok(())
 }
 
-/// A resolved configuration (or none) as an `nn_ai` client configuration.
-pub(crate) fn client_config(resolved: Option<ResolvedProviderConfig>) -> nn_ai::ProviderConfig {
-    resolved.map(Into::into).unwrap_or_default()
+/// The client configuration a stored credential runs with
+/// ([`net::prepare_client_config`]); the error is a user-facing reason.
+pub(crate) async fn credential_client_config(state: &AppState, credential: &Credential) -> Result<nn_ai::ProviderConfig, String> {
+    net::prepare_client_config(
+        &state.config.providers,
+        &credential.provider,
+        Some((credential.provider_config(), ConfigSource::Database)),
+    )
+    .await
 }
 
-/// List a provider's models with `config`. Failures (bad key, unreachable
-/// server, a rejected URL, an unknown provider) are logged and give an
-/// empty list, as in the Python discovery functions.
+/// The provider of a credential record, read without decrypting its key.
+/// `None` when the record does not exist.
+pub(crate) async fn credential_provider(state: &AppState, id: &str) -> AppResult<Option<String>> {
+    let Ok(id) = credential_id(id) else { return Ok(None) };
+    Ok(state
+        .db
+        .select(&id)
+        .await?
+        .and_then(|row| row.get("provider").and_then(Json::as_str).map(nn_ai::normalize_provider_name)))
+}
+
+/// The 400 for linking a model of one provider to another provider's
+/// credential (its key would be sent to the wrong service).
+pub(crate) fn provider_mismatch(credential_provider: &str, model_provider: &str) -> AppError {
+    AppError::bad_request(format!(
+        "Credential provider '{credential_provider}' does not match model provider '{model_provider}'"
+    ))
+}
+
+/// List a provider's models with a prepared `config`. Failures (bad key,
+/// unreachable server, an unknown provider) are logged and give an empty
+/// list, as in the Python discovery functions.
 pub(crate) async fn discover_with_config(
     state: &AppState,
     provider: &str,
     config: &nn_ai::ProviderConfig,
 ) -> Vec<nn_ai::DiscoveredModel> {
-    if let Err(e) = validate_config_urls(config).await {
-        tracing::warn!("Failed to discover {provider} models: {e}");
-        return Vec::new();
-    }
     match state.models.clients().discover_models(provider, config).await {
         Ok(models) => models,
         Err(e) => {
@@ -515,7 +537,7 @@ pub async fn create_credential(state: &AppState, input: &NewCredential) -> AppRe
     input.validate()?;
     crypto::require_encryption_key(&state.config)?;
     for url in input.urls().into_iter().flatten() {
-        check_url(url).await?;
+        check_url(state, url).await?;
     }
     let mut credential = Credential {
         name: input.name.clone(),
@@ -535,17 +557,59 @@ pub async fn create_credential(state: &AppState, input: &NewCredential) -> AppRe
         num_ctx: input.num_ctx,
         ..Credential::default()
     };
+    check_targets(state, &credential)?;
     credential.save(state).await.map_err(mask("Failed to create credential"))?;
     Ok(CredentialResponse::from_credential(&credential, 0))
 }
 
-/// Partially update a credential (see [`CredentialUpdate`]).
+/// Where a credential sends its key: base URL, endpoints and the Vertex key
+/// file, normalised (trimmed, no trailing slash, blank as unset).
+fn targets(credential: &Credential) -> Vec<Option<String>> {
+    [
+        &credential.base_url,
+        &credential.endpoint,
+        &credential.endpoint_llm,
+        &credential.endpoint_embedding,
+        &credential.endpoint_stt,
+        &credential.endpoint_tts,
+        &credential.credentials_path,
+    ]
+    .into_iter()
+    .map(|value| value.as_deref().map(|v| v.trim().trim_end_matches('/').to_string()).filter(|v| !v.is_empty()))
+    .collect()
+}
+
+/// Whether going from `before` to `after` ([`targets`]) points the key at a
+/// new address.
+fn moves_key(provider: &str, before: &[Option<String>], after: &[Option<String>]) -> bool {
+    let own_domain = |url: &str| match nn_ai::base_url_rule(provider) {
+        rule @ nn_ai::BaseUrlRule::Domains(_) => url::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(|host| rule.allows(u.scheme(), host)))
+            .unwrap_or(false),
+        _ => false,
+    };
+    before.iter().zip(after).enumerate().any(|(index, (old, new))| match new {
+        Some(new) if Some(new) != old.as_ref() => !(index == 0 && own_domain(new)),
+        _ => false,
+    })
+}
+
+/// The 400 detail when a credential's address changes without its key.
+pub const REKEY_DETAIL: &str =
+    "Re-enter the API key to change the base URL, endpoints or credentials path: a stored key is never sent to a new address";
+
+/// Partially update a credential (see [`CredentialUpdate`]). Changing
+/// where it points while it holds a key requires `api_key` in the same
+/// request ([`REKEY_DETAIL`]).
 pub async fn update_credential(state: &AppState, id: &str, update: &CredentialUpdate) -> AppResult<CredentialResponse> {
     crypto::require_encryption_key(&state.config)?;
     for url in update.urls().into_iter().flatten().flatten() {
-        check_url(url).await?;
+        check_url(state, url).await?;
     }
     let mut credential = load(state, id, "Failed to update credential").await?;
+    let targets_before = targets(&credential);
+    let had_key = credential.api_key.as_ref().is_some_and(|k| !k.expose().trim().is_empty());
 
     let cleared = |value: &Option<String>| value.clone().filter(|v| !v.is_empty());
     if let Some(name) = &update.name {
@@ -577,9 +641,19 @@ pub async fn update_credential(state: &AppState, id: &str, update: &CredentialUp
         credential.num_ctx = num_ctx.filter(|n| *n != 0);
     }
 
+    // A stored key is only ever sent where it was entered for: pointing a
+    // credential somewhere new (base URL, any endpoint, the Vertex key file)
+    // needs the key in the same request. Clearing a target, or moving a
+    // first-party provider within its own domain, is not "somewhere new".
+    // The record cannot change its provider (`provider` is not an update
+    // field).
+    if had_key && update.api_key.is_none() && moves_key(&credential.provider, &targets_before, &targets(&credential)) {
+        return Err(AppError::bad_request(REKEY_DETAIL));
+    }
     credential
         .check_required_fields()
         .map_err(|e| AppError::bad_request(truncate(&e.to_string(), 200)))?;
+    check_targets(state, &credential)?;
     credential.save(state).await.map_err(mask("Failed to update credential"))?;
     let count = credential.linked_models(state).await.map_err(mask("Failed to update credential"))?.len();
     Ok(CredentialResponse::from_credential(&credential, count))
@@ -599,6 +673,10 @@ pub async fn delete_credential(state: &AppState, id: &str, migrate_to: Option<&s
         match migrate_to.filter(|m| !m.is_empty()) {
             Some(target) if !linked.is_empty() => {
                 let target = load(state, target, "Failed to delete credential").await?;
+                let target_provider = nn_ai::normalize_provider_name(&target.provider);
+                if let Some(model) = linked.iter().find(|m| nn_ai::normalize_provider_name(&m.provider) != target_provider) {
+                    return Err(provider_mismatch(&target_provider, &model.provider));
+                }
                 for mut model in linked {
                     model.credential = Some(target.id.clone());
                     model.save(state).await?;
@@ -646,10 +724,10 @@ pub async fn test_credential(state: &AppState, id: &str) -> nn_ai::ConnectionTes
         }
     };
     let provider = credential.provider.to_lowercase();
-    let config = client_config(Some(credential.provider_config()));
-    if let Err(e) = validate_config_urls(&config).await {
-        return failed_test(&provider, &e);
-    }
+    let config = match credential_client_config(state, &credential).await {
+        Ok(config) => config,
+        Err(e) => return failed_test(&provider, &e),
+    };
     state.models.clients().test_provider_connection(&provider, &config).await
 }
 
@@ -658,9 +736,14 @@ pub async fn test_credential(state: &AppState, id: &str) -> nn_ai::ConnectionTes
 pub async fn discover_credential_models(state: &AppState, id: &str) -> AppResult<DiscoverModelsResponse> {
     let credential = load_keeping_not_found(state, id, "Failed to discover models").await?;
     let provider = credential.provider.to_lowercase();
-    let config = client_config(Some(credential.provider_config()));
-    let discovered = discover_with_config(state, &provider, &config)
-        .await
+    let discovered = match credential_client_config(state, &credential).await {
+        Ok(config) => discover_with_config(state, &provider, &config).await,
+        Err(e) => {
+            tracing::warn!("Failed to discover {provider} models: {e}");
+            Vec::new()
+        }
+    };
+    let discovered = discovered
         .into_iter()
         .map(|m| DiscoveredModelResponse { name: m.name, provider: m.provider, model_type: None, description: m.description })
         .collect();
@@ -694,6 +777,13 @@ pub async fn register_credential_models(
     models: &[RegisterModel],
 ) -> AppResult<RegisterModelsResult> {
     let credential = load_keeping_not_found(state, id, "Failed to register models").await?;
+    let credential_provider = nn_ai::normalize_provider_name(&credential.provider);
+    if let Some(data) = models
+        .iter()
+        .find(|m| !m.provider.is_empty() && nn_ai::normalize_provider_name(&m.provider) != credential_provider)
+    {
+        return Err(provider_mismatch(&credential_provider, &data.provider));
+    }
     let result = async {
         let mut existing_keys = existing_model_keys(state, &credential.provider).await?;
         let mut result = RegisterModelsResult { created: 0, existing: 0 };
@@ -1133,5 +1223,178 @@ mod tests {
         let again = migrate_from_env_with(&state, &lookup).await.unwrap();
         assert!(again.migrated.is_empty());
         assert_eq!(again.skipped, ["groq", "deepseek", "zai"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Where a stored key may go (issue #32), through the HTTP surface
+    // -----------------------------------------------------------------------
+
+    use axum::http::StatusCode;
+    use serde_json::{json, Value};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::testing::TestApp;
+
+    async fn create(app: &TestApp, body: Value) -> String {
+        let (status, created) = app.post("/api/credentials", body).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        created["id"].as_str().unwrap().to_string()
+    }
+
+    async fn models_server(key: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", format!("Bearer {key}").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [{ "id": "m" }] })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn moving_a_credential_to_a_new_url_needs_its_key() {
+        let app = TestApp::new().await;
+        let home = models_server("sk-real").await;
+        let attacker = MockServer::start().await;
+        Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [] }))).mount(&attacker).await;
+        let id = create(
+            &app,
+            json!({ "name": "Local", "provider": "openai_compatible", "api_key": "sk-real", "base_url": format!("{}/v1", home.uri()) }),
+        )
+        .await;
+
+        // The attack: change only the URL, then test. Refused, nothing stored.
+        let (status, body) = app.put(&format!("/api/credentials/{id}"), json!({ "base_url": format!("{}/v1", attacker.uri()) })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["detail"], REKEY_DETAIL);
+        for field in ["endpoint", "endpoint_llm", "endpoint_embedding", "endpoint_stt", "endpoint_tts", "credentials_path"] {
+            let (status, _) = app.put(&format!("/api/credentials/{id}"), json!({ field: format!("{}/x", attacker.uri()) })).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}");
+        }
+        let (_, body) = app.post(&format!("/api/credentials/{id}/test"), json!({})).await;
+        assert_eq!(body["success"], true, "{body}");
+        assert!(attacker.received_requests().await.unwrap().is_empty(), "the stored key reached the new host");
+        let stored = Credential::get(&app.state, &id).await.unwrap();
+        assert_eq!(stored.base_url.as_deref(), Some(format!("{}/v1", home.uri()).as_str()));
+
+        // Re-posting the same URL (the web form always sends it), renaming,
+        // or trying to switch provider is fine; the provider stays.
+        let (status, body) = app
+            .put(&format!("/api/credentials/{id}"), json!({ "name": "Renamed", "base_url": format!("{}/v1/", home.uri()), "provider": "openai" }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["provider"], "openai_compatible");
+
+        // With the key in the same request the move goes through, and the
+        // new host gets the new key only.
+        let (status, body) = app
+            .put(&format!("/api/credentials/{id}"), json!({ "base_url": format!("{}/v1", attacker.uri()), "api_key": "sk-for-attacker" }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        app.post(&format!("/api/credentials/{id}/test"), json!({})).await;
+        let sent = attacker.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].headers.get("authorization").unwrap(), "Bearer sk-for-attacker");
+
+        // A credential without a key can move freely (nothing to leak).
+        let keyless = create(&app, json!({ "name": "Ollama", "provider": "ollama", "base_url": "http://127.0.0.1:11434" })).await;
+        let (status, body) = app.put(&format!("/api/credentials/{keyless}"), json!({ "base_url": "http://127.0.0.1:11435" })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_web_form_goes_through_the_same_rule() {
+        let app = TestApp::new().await;
+        let id = create(&app, json!({ "name": "Local", "provider": "openai_compatible", "api_key": "sk-real", "base_url": "http://127.0.0.1:1/v1" })).await;
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/settings/models/credentials/{id}"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(axum::body::Body::from("provider=openai_compatible&name=Local&api_key=&base_url=https%3A%2F%2Fattacker.example%2Fv1"))
+            .unwrap();
+        let response = app.send(request).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(Credential::get(&app.state, &id).await.unwrap().base_url.as_deref(), Some("http://127.0.0.1:1/v1"));
+    }
+
+    #[tokio::test]
+    async fn first_party_credentials_only_point_at_their_provider() {
+        let app = TestApp::new().await;
+        let (status, body) = app
+            .post("/api/credentials", json!({ "name": "x", "provider": "openai", "api_key": "sk", "base_url": "https://attacker.example/v1" }))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["detail"].as_str().unwrap().contains("openai.com"), "{body}");
+        let id = create(&app, json!({ "name": "x", "provider": "openai", "api_key": "sk-real", "base_url": "https://api.openai.com/v1" })).await;
+        // Even with the key re-entered, a foreign host is refused for openai.
+        let (status, _) = app
+            .put(&format!("/api/credentials/{id}"), json!({ "base_url": "https://attacker.example/v1", "api_key": "sk-real" }))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // A row written before these checks is refused at use, not followed.
+        let mut old = Credential::get(&app.state, &id).await.unwrap();
+        old.base_url = Some("https://attacker.example/v1".into());
+        old.save(&app.state).await.unwrap();
+        assert!(credential_client_config(&app.state, &old).await.is_err(), "the key would go to the stored URL");
+        let (_, body) = app.post(&format!("/api/credentials/{id}/test"), json!({})).await;
+        assert_eq!(body["success"], false, "{body}");
+
+        // Vertex takes no base URL, a plain location and a confined key file.
+        let vertex = |extra: Value| {
+            let mut body = json!({ "name": "v", "provider": "vertex", "project": "p", "location": "us-central1" });
+            body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            body
+        };
+        for extra in [
+            json!({ "base_url": "https://attacker.example" }),
+            json!({ "location": "attacker.example/x" }),
+            json!({ "credentials_path": "/etc/hosts" }),
+        ] {
+            let (status, body) = app.post("/api/credentials", vertex(extra.clone())).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}: {body}");
+        }
+        let dir = app.state.config.providers.vertex_credentials_dirs[0].clone();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sa.json"), "{}").unwrap();
+        create(&app, vertex(json!({ "credentials_path": dir.join("sa.json").display().to_string() }))).await;
+    }
+
+    #[tokio::test]
+    async fn models_only_use_credentials_of_their_own_provider() {
+        let app = TestApp::new().await;
+        let anthropic = create(&app, json!({ "name": "A", "provider": "anthropic", "api_key": "sk-ant" })).await;
+        let openai = create(&app, json!({ "name": "O", "provider": "openai", "api_key": "sk-oai" })).await;
+
+        let (status, body) = app
+            .post("/api/models", json!({ "name": "gpt-4o", "provider": "openai", "type": "language", "credential": anthropic }))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["detail"].as_str().unwrap().contains("does not match"), "{body}");
+        let (status, body) = app
+            .post("/api/models", json!({ "name": "gpt-4o", "provider": "openai", "type": "language", "credential": openai }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let model_id = body["id"].as_str().unwrap().to_string();
+
+        let register = json!({ "models": [{ "name": "gpt-4o", "provider": "openai", "model_type": "language" }] });
+        let (status, _) = app.post(&format!("/api/credentials/{anthropic}/register-models"), register).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _) = app.delete(&format!("/api/credentials/{openai}?migrate_to={anthropic}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(Model::get(&app.state, &model_id).await.is_ok(), "nothing was deleted or moved");
+
+        // A link made before the check is refused at use, not followed.
+        let mut model = Model::get(&app.state, &model_id).await.unwrap();
+        model.credential = Some(anthropic.clone());
+        model.save(&app.state).await.unwrap();
+        let err = model.provider_config(&app.state).await.unwrap_err();
+        assert!(err.to_string().contains("linked to a credential for anthropic"), "{err}");
+        let (status, body) = app.post(&format!("/api/models/{model_id}/test"), json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["success"], false, "{body}");
     }
 }

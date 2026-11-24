@@ -13,7 +13,7 @@ use url::Url;
 
 use super::ExtractContext;
 use crate::error::ContentError;
-use crate::url_validation::{prepare_pinned_http_target_with, validate_url_with};
+use crate::url_validation::{is_public_ip, prepare_pinned_http_target_with, validate_url_with, UrlPolicy};
 
 /// A downloaded response body.
 #[derive(Debug, Clone)]
@@ -74,8 +74,14 @@ async fn send(
     accept: &str,
 ) -> Result<(Url, reqwest::Response), ContentError> {
     let mut current = url.clone();
+    let mut policy = ctx.url_policy;
     for _ in 0..=ctx.limits.max_redirects {
-        let client = client_for(&current, ctx).await?;
+        let client = client_for(&current, ctx, &policy).await?;
+        if !policy.block_private_networks && target_is_public(&current, ctx).await {
+            // Even when private addresses are allowed, once a hop is public
+            // the chain may not lead back into the private network.
+            policy = UrlPolicy::public_only();
+        }
         let response = client
             .request(method.clone(), current.clone())
             .header(ACCEPT, accept)
@@ -99,8 +105,23 @@ async fn send(
     Err(ContentError::Network(format!("more than {} redirects", ctx.limits.max_redirects)))
 }
 
-/// Validate `url` and build a client that can only reach what was validated.
-async fn client_for(url: &Url, ctx: &ExtractContext) -> Result<reqwest::Client, ContentError> {
+/// True when every address `url` names is public. Unresolvable hosts are not.
+async fn target_is_public(url: &Url, ctx: &ExtractContext) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => is_public_ip(ip.into()),
+        Some(url::Host::Ipv6(ip)) => is_public_ip(ip.into()),
+        Some(url::Host::Domain(host)) => ctx
+            .resolver
+            .resolve(host)
+            .await
+            .is_ok_and(|addrs| !addrs.is_empty() && addrs.into_iter().all(is_public_ip)),
+        None => false,
+    }
+}
+
+/// Validate `url` under `policy` and build a client that can only reach what
+/// was validated.
+async fn client_for(url: &Url, ctx: &ExtractContext, policy: &UrlPolicy) -> Result<reqwest::Client, ContentError> {
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(ctx.limits.connect_timeout)
@@ -111,13 +132,13 @@ async fn client_for(url: &Url, ctx: &ExtractContext) -> Result<reqwest::Client, 
         Some(proxy) => {
             // The proxy resolves the name, so the address cannot be pinned;
             // the check still rejects what resolves badly from here.
-            validate_url_with(url.as_str(), &ctx.url_policy, ctx.resolver.as_ref()).await?;
+            validate_url_with(url.as_str(), policy, ctx.resolver.as_ref()).await?;
             let proxy = reqwest::Proxy::all(proxy.as_str())
                 .map_err(|_| ContentError::Configuration("the configured proxy URL is not valid".to_string()))?;
             builder = builder.proxy(proxy);
         }
         None => {
-            let target = prepare_pinned_http_target_with(url.as_str(), &ctx.url_policy, ctx.resolver.as_ref())
+            let target = prepare_pinned_http_target_with(url.as_str(), policy, ctx.resolver.as_ref())
                 .await
                 .map_err(|error| {
                     if error.is_unresolved_host() {

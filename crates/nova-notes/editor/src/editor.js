@@ -217,11 +217,22 @@ function initDoc(doc) {
   return noteId;
 }
 
+// Markdown images that point off this server become plain links before
+// import. BlockSuite fetches every http(s) image it imports, so a model answer
+// saved as a note could otherwise send data to any URL just by being opened.
+// Same-origin paths (/note-blobs/...) and data: images are kept.
+const REMOTE_IMAGE = /!\[([^\]]*)\]\(\s*<?((?:[a-z][a-z0-9+.-]*:|[\\/]{2})[^)\s>]*)>?[^)]*\)/gi;
+
+function unlinkRemoteImages(markdown) {
+  return markdown.replace(REMOTE_IMAGE, (all, alt, url) =>
+    /^data:image\//i.test(url) ? all : "[" + (alt.trim() || url) + "](" + url + ")");
+}
+
 async function importMarkdown(doc, noteId, markdown) {
   const job = new Job({ collection: doc.collection, middlewares: [] });
   const adapter = new MarkdownAdapter(job);
   const snapshot = await adapter.toSliceSnapshot({
-    file: markdown,
+    file: unlinkRemoteImages(markdown),
     assets: job.assetsManager,
     workspaceId: doc.collection.id,
     pageId: doc.id,

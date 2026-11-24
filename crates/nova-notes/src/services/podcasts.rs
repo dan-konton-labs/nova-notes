@@ -1086,9 +1086,36 @@ fn notebook_ref(notebook_id: Option<&str>) -> Option<String> {
     non_empty(notebook_id).map(|id| with_table(Notebook::TABLE, id))
 }
 
+/// The longest content an episode is generated from by default
+/// (`OPEN_NOTEBOOK_MAX_PODCAST_CONTENT_CHARS`). It is stored twice (job
+/// arguments and the episode) and sent whole to the outline model, so it is
+/// capped well below the request body limit.
+pub const MAX_PODCAST_CONTENT_CHARS: usize = 2_000_000;
+
+fn max_podcast_content_chars() -> usize {
+    crate::config::env_nonempty("OPEN_NOTEBOOK_MAX_PODCAST_CONTENT_CHARS")
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(MAX_PODCAST_CONTENT_CHARS)
+}
+
+/// `2000000` → `"2,000,000"`.
+fn with_thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Check a generation request and build its job arguments: the episode and
 /// speaker profiles must exist (404 otherwise) and there must be content,
-/// given directly or taken from the notebook.
+/// given directly or taken from the notebook, of at most
+/// [`MAX_PODCAST_CONTENT_CHARS`] characters (400 otherwise).
 async fn generation_args(
     state: &AppState,
     episode_profile: &str,
@@ -1120,6 +1147,13 @@ async fn generation_args(
     }
     let content =
         content.ok_or_else(|| AppError::invalid("Content is required - provide either content or notebook_id"))?;
+    let max = max_podcast_content_chars();
+    if content.chars().count() > max {
+        return Err(AppError::invalid(format!(
+            "The podcast content is too long ({} characters at most).",
+            with_thousands(max)
+        )));
+    }
     Ok(GeneratePodcastArgs {
         episode_profile: episode_profile.to_string(),
         speaker_profile: Some(speaker.id),
@@ -1140,6 +1174,9 @@ async fn script_args(
     script: &str,
     notebook_id: Option<&str>,
 ) -> AppResult<ReadScriptArgs> {
+    if script.chars().count() > nn_podcast::script::MAX_SCRIPT_CHARS {
+        return Err(AppError::invalid("The script is too long (500,000 characters at most)."));
+    }
     let speaker = resolve_speaker_profile(state, speaker_profile)
         .await?
         .ok_or_else(|| AppError::not_found(format!("Speaker profile '{speaker_profile}' not found")))?;
@@ -1148,13 +1185,25 @@ async fn script_args(
     }
     let names: Vec<String> =
         speaker.speakers.iter().filter_map(|s| s.get("name").and_then(Json::as_str)).map(String::from).collect();
-    nn_podcast::parse_script(script, &names).map_err(podcast_error)?;
+    let script = script.to_string();
+    let (script, _) = parse_script_blocking(script, names).await?;
     Ok(ReadScriptArgs {
         speaker_profile: speaker.id,
         episode_name: episode_name.to_string(),
-        script: script.to_string(),
+        script,
         notebook_id: notebook_ref(notebook_id),
     })
+}
+
+/// Parse a script on the blocking pool: a long script is CPU work that would
+/// otherwise hold up an async worker thread. Hands the script back.
+async fn parse_script_blocking(script: String, speaker_names: Vec<String>) -> AppResult<(String, Vec<nn_podcast::models::Dialogue>)> {
+    tokio::task::spawn_blocking(move || {
+        let turns = nn_podcast::parse_script(&script, &speaker_names).map_err(podcast_error)?;
+        Ok((script, turns))
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Parsing the script was interrupted: {e}")))?
 }
 
 async fn submit(state: &AppState, name: &str, args: impl Serialize) -> AppResult<String> {
@@ -1247,9 +1296,11 @@ pub async fn retry_episode(state: &AppState, episode_id: &str) -> AppResult<Retr
         (GENERATE_PODCAST, serde_json::to_value(args)?)
     };
 
+    // Take a place in the queue first: a full queue (429) must not cost the episode.
+    let slot = state.jobs.reserve()?;
     remove_episode_files(state, &episode).await;
     state.db.delete(&episode.id).await?;
-    let job_id = submit(state, command, args).await?;
+    let job_id = state.jobs.submit_reserved(slot, command, args).await?;
     Ok(RetrySubmitted { job_id, message: "Retry submitted successfully".into() })
 }
 
@@ -1547,8 +1598,7 @@ async fn run_script_job(ctx: JobContext, args: Json) -> AppResult<Json> {
         .ok_or_else(|| AppError::invalid(format!("Speaker profile '{}' not found", args.speaker_profile)))?;
     let engine_speaker_profile = speaker_profile.to_engine()?;
     let tts = tts_models(&state, &engine_speaker_profile, true).await?;
-    let turns =
-        nn_podcast::parse_script(&args.script, &engine_speaker_profile.speaker_names()).map_err(podcast_error)?;
+    let (_, turns) = parse_script_blocking(args.script.clone(), engine_speaker_profile.speaker_names()).await?;
 
     let speaker_snapshot = state.db.select(&speaker_profile.id).await?.unwrap_or_else(|| json!({}));
     let doc = Doc::new()
@@ -1585,4 +1635,36 @@ async fn run_script_job(ctx: JobContext, args: Json) -> AppResult<Json> {
         processing_time,
         error_message: None,
     })?)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use crate::testing::TestApp;
+
+    #[test]
+    fn thousands_separators() {
+        assert_eq!(super::with_thousands(2_000_000), "2,000,000");
+        assert_eq!(super::with_thousands(999), "999");
+        assert_eq!(super::with_thousands(12_345), "12,345");
+    }
+
+    /// Issue #34: the API applies the script length limit the web form does,
+    /// before any parsing or lookup.
+    #[tokio::test]
+    async fn read_script_refuses_an_overlong_script() {
+        let app = TestApp::new().await;
+        let script = "*a ".repeat(nn_podcast::script::MAX_SCRIPT_CHARS / 3 + 1);
+        let (status, body) = app
+            .post(
+                "/api/podcasts/read-script",
+                serde_json::json!({ "speaker_profile": "nobody", "episode_name": "x", "script": script }),
+            )
+            .await;
+        assert_eq!(
+            (status, body["detail"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("The script is too long (500,000 characters at most)."))
+        );
+    }
 }

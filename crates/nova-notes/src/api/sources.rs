@@ -428,7 +428,8 @@ mod tests {
             .await;
         let app = TestApp::new().await;
         mock_models(&app, &[]);
-        // Loopback is allowed (self-hosted), as in the Python build.
+        // Loopback is allowed under OPEN_NOTEBOOK_SOURCE_URL_POLICY=self_hosted
+        // (the test configuration), as in the Python build.
         let (status, body) = app.post("/api/sources/json", json!({ "type": "link", "url": server.uri(), "embed": true })).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["title"], "Local Page");
@@ -438,6 +439,33 @@ mod tests {
         // Link-local (cloud metadata) addresses are refused before any fetch.
         let (status, body) = app.post("/api/sources/json", json!({ "type": "link", "url": "http://169.254.169.254/latest" })).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test]
+    async fn link_sources_to_internal_addresses_are_refused_by_default() {
+        let server = wiremock::MockServer::start().await;
+        let app = TestApp::with_config(|c| {
+            c.source_url_policy = crate::config::parse_source_url_policy(None);
+        })
+        .await;
+        mock_models(&app, &[]);
+        for url in [
+            server.uri(),
+            "http://127.0.0.1:11434/api/tags".to_string(),
+            "http://10.0.0.1/".to_string(),
+            "http://192.168.1.1/".to_string(),
+            "http://100.64.0.1/".to_string(),
+            "http://0.0.0.0:8080/".to_string(),
+            "http://[::1]/".to_string(),
+            "http://100.100.100.200/latest/meta-data/".to_string(),
+        ] {
+            let (status, body) = app.post("/api/sources/json", json!({ "type": "link", "url": url })).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {body}");
+            assert!(body["detail"].as_str().unwrap().contains("not allowed"), "{url}: {body}");
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+        let (_, list) = app.get("/api/sources").await;
+        assert_eq!(list.as_array().map(Vec::len), Some(0), "{list}");
     }
 
     #[tokio::test]
@@ -653,6 +681,90 @@ mod tests {
         assert_eq!((status, body["detail"].as_str()), (StatusCode::BAD_REQUEST, Some("Source has no text content")));
         let (status, body) = app.post(&format!("/api/sources/{}/retry", empty.id), json!({})).await;
         assert_eq!((status, body["detail"].as_str()), (StatusCode::BAD_REQUEST, Some("Source is not associated with any notebooks")));
+    }
+
+    #[tokio::test]
+    async fn stored_file_paths_outside_uploads_are_neither_read_nor_deleted() {
+        let app = TestApp::new().await;
+        let notebook_id = notebook(&app).await;
+        // A row pointing outside the uploads directory, as a direct database
+        // write could leave it.
+        let outside = app.state.config.data_dir.join("precious.txt");
+        std::fs::write(&outside, "keep me").unwrap();
+        let asset = crate::domain::source::Asset { file_path: Some(outside.to_string_lossy().into_owned()), url: None };
+        let source =
+            Source::create(&app.state, &Source { title: Some("Planted".into()), asset: Some(asset), ..Source::default() })
+                .await
+                .unwrap();
+        source.add_to_notebook(&app.state, &notebook_id).await.unwrap();
+
+        let (status, body) = app.post(&format!("/api/sources/{}/retry", source.id), json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["detail"], "Invalid file path: must be within the uploads directory");
+        assert!(Source::get(&app.state, &source.id).await.unwrap().command.is_none(), "nothing was queued");
+
+        let (status, body) = app.delete(&format!("/api/sources/{}", source.id)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(outside.exists(), "the file outside uploads survives");
+        assert_eq!(app.get(&format!("/api/sources/{}", source.id)).await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn text_sources_over_the_size_cap_are_refused() {
+        let app = TestApp::with_config(|c| c.max_text_source_chars = 20).await;
+        mock_models(&app, &[]);
+        let notebook_id = notebook(&app).await;
+        let commands = app.state.db.query("SELECT id FROM command", crate::db::Params::new()).await.unwrap().len();
+        for async_processing in [false, true] {
+            let (status, body) = app
+                .post(
+                    "/api/sources/json",
+                    json!({ "type": "text", "content": "é".repeat(21), "notebook_id": notebook_id, "async_processing": async_processing }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body["detail"].as_str().unwrap().contains("too long (20 characters at most"), "{body}");
+        }
+        let (_, list) = app.get("/api/sources").await;
+        assert_eq!(list.as_array().map(Vec::len), Some(0), "{list}");
+        let after = app.state.db.query("SELECT id FROM command", crate::db::Params::new()).await.unwrap().len();
+        assert_eq!(after, commands, "no job was stored");
+
+        // Exactly at the cap (in characters, not bytes) is fine.
+        let (status, body) =
+            app.post("/api/sources/json", json!({ "type": "text", "content": "é".repeat(20), "notebook_id": notebook_id })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // A stored text over the cap is not re-queued by retry either.
+        let source_id = body["id"].as_str().unwrap();
+        app.state.db.update(source_id, crate::db::Doc::new().set("full_text", "x".repeat(25))).await.unwrap();
+        app.wait_for_idle().await;
+        let (status, body) = app.post(&format!("/api/sources/{source_id}/retry"), json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test]
+    async fn retry_keeps_the_full_queue_429() {
+        let app = TestApp::new().await;
+        mock_models(&app, &[]);
+        let notebook_id = notebook(&app).await;
+        let (status, body) =
+            app.post("/api/sources/json", json!({ "type": "text", "content": "Body text.", "notebook_id": notebook_id })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let source_id = body["id"].as_str().unwrap().to_string();
+        app.wait_for_idle().await;
+
+        // One slow job fills a queue of one.
+        app.state.jobs.register("zz_hold", crate::jobs::RetryPolicy::once(), |_ctx, _args| async move {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok(Value::Null)
+        });
+        app.state.jobs.set_max_pending(1);
+        let hold = app.state.jobs.submit("zz_hold", Value::Null).await.unwrap();
+        let (status, body) = app.post(&format!("/api/sources/{source_id}/retry"), json!({})).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert!(body["detail"].as_str().unwrap().contains("Too many background jobs"), "{body}");
+        app.state.jobs.cancel(&hold).await.unwrap();
     }
 
     #[tokio::test]

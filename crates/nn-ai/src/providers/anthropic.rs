@@ -190,7 +190,7 @@ impl LanguageModel for AnthropicChat {
 
     async fn chat(&self, messages: &[ChatMessage], options: &ChatOptions) -> AiResult<ChatResponse> {
         let response = self.request(messages, options, false).await?;
-        let body = response.bytes().await.map_err(|e| crate::error::transport_error(&self.provider, e))?;
+        let body = crate::http::read_body(&self.provider, response, crate::http::MAX_JSON_RESPONSE_BYTES).await?;
         let json: Value =
             serde_json::from_slice(&body).map_err(|_| self.http.malformed("the response was not valid JSON"))?;
         let content = json.get("content").ok_or_else(|| self.http.malformed("no content in the message"))?;

@@ -197,10 +197,9 @@ fn model_test_outcome(err: &AiError) -> (bool, String) {
 struct Ping {
     cannot_connect: &'static str,
     timed_out: &'static str,
-    /// JSON key holding the model array and the key naming each model.
+    /// JSON key holding the model array.
     list_key: &'static str,
-    name_key: &'static str,
-    /// `"Connected. 3 {connected_suffix}: a, b, c"`.
+    /// `"Connected. 3 {connected_suffix}"`.
     connected_suffix: &'static str,
     empty: &'static str,
     status_prefix: &'static str,
@@ -212,7 +211,6 @@ const SERVER_PING: Ping = Ping {
     cannot_connect: "Cannot connect to server. Check the URL is correct.",
     timed_out: "Connection timed out. Check if server is accessible.",
     list_key: "data",
-    name_key: "id",
     connected_suffix: "models available",
     empty: "Connected successfully (no models listed)",
     status_prefix: "Server",
@@ -223,7 +221,6 @@ const OLLAMA_PING: Ping = Ping {
     cannot_connect: "Cannot connect to Ollama. Check if Ollama server is running.",
     timed_out: "Connection timed out. Check if Ollama server is accessible.",
     list_key: "models",
-    name_key: "name",
     ..SERVER_PING
 };
 
@@ -247,24 +244,20 @@ async fn ping(request: reqwest::RequestBuilder, kind: &Ping) -> (bool, String) {
     };
     match response.status().as_u16() {
         200 => {
-            let json: Value = match response.json().await {
-                Ok(json) => json,
-                Err(_) => return (false, "Connection error: the server did not return a model list".to_string()),
+            let listed = crate::http::read_body("server", response, crate::http::MAX_JSON_RESPONSE_BYTES)
+                .await
+                .ok()
+                .and_then(|body| serde_json::from_slice::<Value>(&body).ok());
+            let Some(json) = listed else {
+                return (false, "Connection error: the server did not return a model list".to_string());
             };
-            let models = json.get(kind.list_key).and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
-            if models.is_empty() {
+            let count = json.get(kind.list_key).and_then(Value::as_array).map_or(0, Vec::len);
+            if count == 0 {
                 return (true, kind.empty.to_string());
             }
-            let mut names = models
-                .iter()
-                .take(3)
-                .map(|m| m.get(kind.name_key).and_then(Value::as_str).unwrap_or("unknown"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            if models.len() > 3 {
-                names.push_str(&format!(" (+{} more)", models.len() - 3));
-            }
-            (true, format!("Connected. {} {}: {names}", models.len(), kind.connected_suffix))
+            // Only the count: model names are server-controlled text, and a
+            // connection test must not read back what an arbitrary URL serves.
+            (true, format!("Connected. {count} {}", kind.connected_suffix))
         }
         401 => (false, INVALID_KEY.to_string()),
         403 => (false, NO_PERMISSION.to_string()),
@@ -435,8 +428,14 @@ impl Clients {
             Modality::Language => {
                 let llm = self.language_model(provider, model, config)?;
                 let reply = llm.chat(&[ChatMessage::user("Hi!")], &ChatOptions::default()).await?;
-                let text: String = reply.content.chars().take(100).collect();
-                Ok(format!("Response: {}", if text.is_empty() { "(empty response)" } else { &text }))
+                // The reply's length only: its text is whatever the configured
+                // URL served, and a test result must not read that back.
+                let chars = reply.content.chars().count();
+                Ok(if chars == 0 {
+                    "Response: (empty response)".to_string()
+                } else {
+                    format!("Response received ({chars} characters)")
+                })
             }
             Modality::Embedding => {
                 let embedder = self.embedding_model(provider, model, config)?;
@@ -478,7 +477,7 @@ impl Clients {
                 Ok(if text.is_empty() {
                     "Connection successful (test clip produced no transcription)".to_string()
                 } else {
-                    format!("Transcription: {}", text.chars().take(100).collect::<String>())
+                    format!("Transcription received ({} characters)", text.chars().count())
                 })
             }
         }
@@ -657,7 +656,7 @@ mod tests {
             ConnectionTestResult {
                 provider: "openai_compatible".into(),
                 success: true,
-                message: "Connected. 5 models available: model-0, model-1, model-2 (+2 more)".into(),
+                message: "Connected. 5 models available".into(),
             }
         );
         assert_eq!(header(&request(&server, 0).await, "authorization"), Some("Bearer local-key"));
@@ -718,11 +717,11 @@ mod tests {
             .await;
 
         let ollama = test_provider_connection("ollama", &ProviderConfig::new().with_base_url(server.uri())).await;
-        assert_eq!(ollama.message, "Connected. 2 models available: llama3.2:latest, bge-m3:latest");
+        assert_eq!(ollama.message, "Connected. 2 models available");
 
         let azure_config = ProviderConfig { endpoint: Some(format!("{}/", server.uri())), ..ProviderConfig::new().with_api_key("azure-key") };
         let azure = test_provider_connection("azure", &azure_config).await;
-        assert_eq!(azure.message, "Connected. 2 models: model-0, model-1");
+        assert_eq!(azure.message, "Connected. 2 models");
         assert_eq!(header(&request(&server, 1).await, "api-key"), Some("azure-key"));
 
         let message = |config: ProviderConfig| async move { test_provider_connection("azure", &config).await.message };
@@ -801,7 +800,8 @@ mod tests {
 
         let chat = test_model("openai", "gpt-4o", "language", &config).await;
         assert!(chat.success);
-        assert_eq!(chat.message, format!("Response: {}", &long_reply[..100]));
+        assert_eq!(chat.message, "Response received (300 characters)");
+        assert!(!chat.message.contains("word"), "the reply text is not read back");
         assert_eq!(request_json(&server, 0).await["messages"], json!([{"role": "user", "content": "Hi!"}]));
 
         let embedding = test_model("openai", "text-embedding-3-small", "embedding", &config).await;
@@ -813,7 +813,7 @@ mod tests {
         assert_eq!(request_json(&server, 2).await, json!({"model": "tts-1", "input": "Hello from Open Notebook", "voice": "alloy", "response_format": "mp3"}));
 
         let transcription = test_model("openai", "whisper-1", "speech_to_text", &config).await;
-        assert_eq!(transcription.message, "Transcription: Hello there");
+        assert_eq!(transcription.message, "Transcription received (11 characters)");
         assert!(String::from_utf8_lossy(&request(&server, 3).await.body).contains("filename=\"test_speech.mp3\""));
 
         let odd = test_model("openai", "gpt-4o", "vision", &config).await;

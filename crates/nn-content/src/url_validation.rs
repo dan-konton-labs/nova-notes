@@ -10,13 +10,18 @@
 //! * malformed URLs and URLs without a host,
 //! * link-local addresses (`169.254.0.0/16`, `fe80::/10`, and IPv4-mapped
 //!   forms of them), which is where cloud metadata services live,
-//! * the AWS IMDSv6 address `fd00:ec2::254`,
+//! * the AWS IMDSv6 address `fd00:ec2::254`, and the cloud metadata
+//!   addresses outside link-local (Alibaba `100.100.100.200`, Azure
+//!   `168.63.129.16`, Oracle `192.0.0.192`, Google `fd20:ce::254`),
+//! * IPv6 forms that embed a blocked IPv4 address (IPv4-mapped,
+//!   IPv4-compatible, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`),
 //! * host names that resolve to any of those.
 //!
-//! That is [`UrlPolicy::default`]. [`UrlPolicy::public_only`] is an addition
-//! for deployments that want the stricter rule and also rejects loopback,
+//! That is [`UrlPolicy::default`], kept for operator-configured endpoints
+//! (AI provider base URLs). [`UrlPolicy::public_only`] also rejects loopback,
 //! private, carrier-grade NAT, unique-local, unspecified and multicast
-//! addresses.
+//! addresses; the server uses it for user-supplied source URLs unless the
+//! operator opts out.
 //!
 //! [`validate_url`] checks a URL. [`prepare_pinned_http_target`] additionally
 //! resolves the host once and returns the vetted addresses, so the request can
@@ -158,12 +163,45 @@ const LINK_LOCAL_LITERAL: &str = "Link-local addresses (169.254.x.x) are not all
 These addresses are used for cloud metadata endpoints.";
 const IMDS_V6_LITERAL: &str = "The AWS IMDSv6 metadata address (fd00:ec2::254) is not allowed for \
 security reasons.";
+const METADATA_LITERAL: &str = "Cloud metadata addresses are not allowed for security reasons.";
 const NO_HOST: &str = "Invalid URL: hostname could not be determined.";
 
 const AWS_IMDS_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254);
 
+/// Cloud metadata and host-agent addresses outside link-local, blocked under
+/// every policy: Alibaba Cloud metadata, the Azure WireServer and the Oracle
+/// Cloud legacy metadata address.
+const METADATA_V4: [Ipv4Addr; 3] =
+    [Ipv4Addr::new(100, 100, 100, 200), Ipv4Addr::new(168, 63, 129, 16), Ipv4Addr::new(192, 0, 0, 192)];
+
+/// Google Cloud's IPv6 metadata server address.
+const GCP_METADATA_V6: Ipv6Addr = Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0x0254);
+
 fn is_link_local_v4(ip: Ipv4Addr) -> bool {
     ip.octets()[0] == 169 && ip.octets()[1] == 254
+}
+
+/// The IPv4 address an IPv6 address stands for, when it embeds one:
+/// IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`, except `::`
+/// and `::1`), NAT64 (`64:ff9b::/96`) and 6to4 (`2002:aabb:ccdd::/48`).
+/// These all reach the IPv4 host on a dual-stack or translated network, so
+/// they are judged as that host.
+fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let s = v6.segments();
+    let low = |hi: u16, lo: u16| Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
+    if s[..6] == [0, 0, 0, 0, 0, 0] && !(v6.is_unspecified() || v6.is_loopback()) {
+        return Some(low(s[6], s[7]));
+    }
+    if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return Some(low(s[6], s[7]));
+    }
+    if s[0] == 0x2002 {
+        return Some(low(s[1], s[2]));
+    }
+    None
 }
 
 fn is_internal_v4(ip: Ipv4Addr) -> bool {
@@ -181,13 +219,13 @@ fn is_internal_v4(ip: Ipv4Addr) -> bool {
 /// internal address under [`UrlPolicy::public_only`]. `resolved_from` is the
 /// host name the address came from, when it was not written literally.
 fn reject_dangerous_ip(ip: IpAddr, resolved_from: Option<&str>, policy: &UrlPolicy) -> Result<(), UrlValidationError> {
-    let mapped_v4 = match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+    let embedded = match ip {
+        IpAddr::V6(v6) => embedded_v4(v6),
         IpAddr::V4(_) => None,
     };
     let link_local = match ip {
         IpAddr::V4(v4) => is_link_local_v4(v4),
-        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80 || mapped_v4.is_some_and(is_link_local_v4),
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80 || embedded.is_some_and(is_link_local_v4),
     };
     if link_local {
         return Err(UrlValidationError::new(match resolved_from {
@@ -210,6 +248,19 @@ fn reject_dangerous_ip(ip: IpAddr, resolved_from: Option<&str>, policy: &UrlPoli
         }));
     }
 
+    let metadata = match ip {
+        IpAddr::V4(v4) => METADATA_V4.contains(&v4),
+        IpAddr::V6(v6) => v6 == GCP_METADATA_V6 || embedded.is_some_and(|v4| METADATA_V4.contains(&v4)),
+    };
+    if metadata {
+        return Err(UrlValidationError::new(match resolved_from {
+            Some(host) => format!(
+                "Hostname '{host}' resolves to a cloud metadata address, which is not allowed for security reasons."
+            ),
+            None => METADATA_LITERAL.to_string(),
+        }));
+    }
+
     if policy.block_private_networks {
         let internal = match ip {
             IpAddr::V4(v4) => is_internal_v4(v4),
@@ -219,7 +270,7 @@ fn reject_dangerous_ip(ip: IpAddr, resolved_from: Option<&str>, policy: &UrlPoli
                     || v6.is_multicast()
                     || (v6.segments()[0] & 0xfe00) == 0xfc00
                     || (v6.segments()[0] & 0xffc0) == 0xfec0
-                    || mapped_v4.is_some_and(is_internal_v4)
+                    || embedded.is_some_and(is_internal_v4)
             }
         };
         if internal {
@@ -233,6 +284,19 @@ fn reject_dangerous_ip(ip: IpAddr, resolved_from: Option<&str>, policy: &UrlPoli
         }
     }
     Ok(())
+}
+
+/// True when `ip` passes [`UrlPolicy::public_only`]: not link-local, metadata,
+/// loopback, private, carrier-grade NAT, unique-local or otherwise internal.
+pub fn is_public_ip(ip: IpAddr) -> bool {
+    reject_dangerous_ip(ip, None, &UrlPolicy::public_only()).is_ok()
+}
+
+/// Check one resolved address of `host` against `policy`, for callers that
+/// resolve names themselves (a connect-time DNS resolver). Same rules and
+/// messages as [`validate_url_with`].
+pub fn check_resolved_ip(host: &str, ip: IpAddr, policy: &UrlPolicy) -> Result<(), UrlValidationError> {
+    reject_dangerous_ip(ip, Some(host), policy)
 }
 
 enum Target {
@@ -564,6 +628,7 @@ mod tests {
             "http://172.16.0.1",
             "http://192.168.1.1",
             "http://100.101.102.103",
+            "http://100.64.0.1",
             "http://0.0.0.0",
             "http://[::1]/",
             "http://[fd12:3456::1]/",
@@ -579,6 +644,49 @@ mod tests {
         // The always-on blocks keep their own wording.
         let error = validate_url_with("http://169.254.169.254", &strict, &resolver).await.unwrap_err();
         assert!(error.0.contains("Link-local"));
+    }
+
+    #[tokio::test]
+    async fn cloud_metadata_addresses_are_blocked_under_every_policy() {
+        let resolver = StaticResolver::new().with("meta.example", &[ip("100.100.100.200")]);
+        for policy in [UrlPolicy::self_hosted(), UrlPolicy::public_only()] {
+            for url in [
+                "http://100.100.100.200/latest/meta-data/",
+                "http://168.63.129.16/machine?comp=goalstate",
+                "http://192.0.0.192/latest/",
+                "http://[fd20:ce::254]/computeMetadata/v1/",
+                "http://[::ffff:100.100.100.200]/",
+                "http://[64:ff9b::a83f:8110]/",
+            ] {
+                let error = validate_url_with(url, &policy, &resolver).await.unwrap_err();
+                assert!(error.0.contains("metadata"), "{url}: {error}");
+            }
+            let error = validate_url_with("http://meta.example/", &policy, &resolver).await.unwrap_err();
+            assert!(error.0.contains("meta.example") && error.0.contains("metadata"), "{error}");
+        }
+        // Tailscale MagicDNS (100.100.100.100) is not a metadata address.
+        validate_url_with("http://100.100.100.100/", &UrlPolicy::self_hosted(), &resolver).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ipv6_forms_embedding_ipv4_are_judged_as_that_ipv4() {
+        // 169.254.169.254 as IPv4-compatible, NAT64 and 6to4.
+        for url in ["http://[::a9fe:a9fe]/", "http://[64:ff9b::a9fe:a9fe]/", "http://[2002:a9fe:a9fe::1]/"] {
+            let error = check(url).await.unwrap_err();
+            assert!(error.0.contains("Link-local"), "{url}: {error}");
+        }
+        // 127.0.0.1 / 10.0.0.1 in the same forms are internal under public_only.
+        let strict = UrlPolicy::public_only();
+        for url in ["http://[::7f00:1]/", "http://[64:ff9b::a00:1]/", "http://[2002:a00:1::]/"] {
+            let error = validate_url_with(url, &strict, &PublicResolver).await.unwrap_err();
+            assert!(error.0.contains("rivate"), "{url}: {error}");
+        }
+        // A NAT64 / 6to4 form of a public address is public.
+        validate_url_with("http://[64:ff9b::808:808]/", &strict, &PublicResolver).await.unwrap();
+        validate_url_with("http://[2002:808:808::1]/", &strict, &PublicResolver).await.unwrap();
+        assert!(is_public_ip(ip("8.8.8.8")));
+        assert!(!is_public_ip(ip("100.64.0.1")));
+        assert!(!is_public_ip(ip("::7f00:1")));
     }
 
     // --- prepare_pinned_http_target ---
@@ -672,7 +780,7 @@ mod tests {
         let resolver = StaticResolver::new()
             .with("host.docker.internal", &[ip("192.168.65.2")])
             .with("llm.lan", &[ip("10.0.1.20")])
-            .with("ollama.tail1234.ts.net", &[ip("100.101.102.103")]);
+            .with("ollama.example.ts.net", &[ip("100.101.102.103")]);
 
         let target = pin("http://host.docker.internal:11434/v1/models", &resolver).await.unwrap();
         assert_eq!(target.url, "http://192.168.65.2:11434/v1/models");
@@ -682,9 +790,9 @@ mod tests {
         assert_eq!(target.url, "http://10.0.1.20/v1/models");
         assert_eq!(host_header(&target), expect_host("llm.lan"));
 
-        let target = pin("http://ollama.tail1234.ts.net:11434/api/tags", &resolver).await.unwrap();
+        let target = pin("http://ollama.example.ts.net:11434/api/tags", &resolver).await.unwrap();
         assert_eq!(target.url, "http://100.101.102.103:11434/api/tags");
-        assert_eq!(host_header(&target), expect_host("ollama.tail1234.ts.net:11434"));
+        assert_eq!(host_header(&target), expect_host("ollama.example.ts.net:11434"));
     }
 
     #[tokio::test]

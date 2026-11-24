@@ -245,12 +245,19 @@ impl Model {
     /// The configuration this model's client is built with: its linked
     /// credential when that loads, otherwise the provider's default
     /// credential, otherwise the environment. `None` when nothing is
-    /// configured.
+    /// configured. A linked credential of another provider is a
+    /// `Configuration` error: its key must not go to this model's provider.
     pub async fn provider_config(
         &self,
         state: &AppState,
     ) -> AppResult<Option<(ResolvedProviderConfig, ConfigSource)>> {
         if let Some(credential) = self.credential(state).await {
+            if nn_ai::normalize_provider_name(&credential.provider) != nn_ai::normalize_provider_name(&self.provider) {
+                return Err(AppError::config(format!(
+                    "Model '{}' uses the {} provider but is linked to a credential for {}. Link it to a {} credential in Manage → Models.",
+                    self.name, self.provider, credential.provider, self.provider
+                )));
+            }
             return Ok(Some((credential.provider_config(), ConfigSource::Database)));
         }
         resolve_provider_config(state, &self.provider).await

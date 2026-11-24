@@ -187,9 +187,16 @@ impl Source {
 
     /// Delete the source, its uploaded file, its chunks and its insights.
     pub async fn delete(&self, state: &AppState) -> AppResult<()> {
-        if let Some(path) = self.asset.as_ref().and_then(|a| a.file_path.as_deref()) {
+        if let Some(path) = self.asset.as_ref().and_then(|a| a.file_path.as_deref()).filter(|p| !p.is_empty()) {
             let path = Path::new(path);
-            if path.exists() {
+            if !crate::services::sources::is_within_uploads(&state.config, path) {
+                // Only files this app stored are removed; the record still goes.
+                tracing::warn!(
+                    "Not deleting file {} for source {}: it is outside the uploads directory",
+                    path.display(),
+                    self.id
+                );
+            } else if path.exists() {
                 match std::fs::remove_file(path) {
                     Ok(()) => tracing::info!("Deleted file for source {}: {}", self.id, path.display()),
                     Err(e) => tracing::warn!(

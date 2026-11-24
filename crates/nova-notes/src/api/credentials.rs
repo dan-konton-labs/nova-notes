@@ -206,12 +206,12 @@ mod tests {
 
         // Partial update: absent keeps, null and "" clear, the key changes.
         let (status, updated) = app
-            .put(&format!("/api/credentials/{id}"), json!({ "base_url": "https://gateway.test/v1", "project": "p" }))
+            .put(&format!("/api/credentials/{id}"), json!({ "base_url": "https://us.api.openai.com/v1", "project": "p" }))
             .await;
         assert_eq!(status, StatusCode::OK, "{updated}");
-        assert_eq!(updated["base_url"], "https://gateway.test/v1");
+        assert_eq!(updated["base_url"], "https://us.api.openai.com/v1");
         let (_, updated) = app.put(&format!("/api/credentials/{id}"), json!({ "name": "Renamed" })).await;
-        assert_eq!(updated["base_url"], "https://gateway.test/v1", "absent field keeps its value");
+        assert_eq!(updated["base_url"], "https://us.api.openai.com/v1", "absent field keeps its value");
         assert_eq!(updated["name"], "Renamed");
         let (_, updated) = app.put(&format!("/api/credentials/{id}"), json!({ "base_url": null, "project": "" })).await;
         assert_eq!(updated["base_url"], Value::Null);

@@ -1,37 +1,89 @@
-/**
- * @license
- * Copyright 2023 Google LLC
- * SPDX-License-Identifier: BSD-3-Clause
- */
-/**
- * @license
- * Copyright 2021 Google LLC
- * SPDX-License-Identifier: BSD-3-Clause
- */
-/**
- * @license
- * Copyright 2017 Google LLC
- * SPDX-License-Identifier: BSD-3-Clause
- */
-/**
- * @license
- * Copyright 2022 Google LLC
- * SPDX-License-Identifier: BSD-3-Clause
- */
-/**
- * @license
- * Copyright 2019 Google LLC
- * SPDX-License-Identifier: BSD-3-Clause
- */
-/**
- * @license
- * Copyright 2020 Google LLC
- * SPDX-License-Identifier: BSD-3-Clause
- */
-/**
- * @license
- * Copyright 2018 Google LLC
- * SPDX-License-Identifier: BSD-3-Clause
- */
-/*! @license DOMPurify 3.4.18 | (c) Cure53 and other contributors | Released under the Apache license 2.0 and Mozilla Public License 2.0 | github.com/cure53/DOMPurify/blob/3.4.18/LICENSE */
-/*! regenerator-runtime -- Copyright (c) 2014-present, Facebook, Inc. -- license (MIT): https://github.com/babel/babel/blob/main/packages/babel-helpers/LICENSE */
+Bundled license information:
+
+@blocksuite/global/dist/utils/signal-watcher.js:
+  /**
+   * @license
+   * Copyright 2023 Google LLC
+   * SPDX-License-Identifier: BSD-3-Clause
+   */
+
+@lit/context/lib/context-request-event.js:
+@lit/context/lib/create-context.js:
+@lit/context/lib/controllers/context-consumer.js:
+@lit/context/lib/value-notifier.js:
+@lit/context/lib/controllers/context-provider.js:
+@lit/context/lib/context-root.js:
+@lit/reactive-element/decorators/query-assigned-elements.js:
+lit-html/directives/choose.js:
+lit-html/directives/when.js:
+lit-html/directives/join.js:
+lit-html/directives/keyed.js:
+  /**
+   * @license
+   * Copyright 2021 Google LLC
+   * SPDX-License-Identifier: BSD-3-Clause
+   */
+
+@lit/context/lib/decorators/provide.js:
+@lit/reactive-element/reactive-element.js:
+lit-html/lit-html.js:
+lit-element/lit-element.js:
+@lit/reactive-element/decorators/custom-element.js:
+@lit/reactive-element/decorators/property.js:
+@lit/reactive-element/decorators/state.js:
+@lit/reactive-element/decorators/event-options.js:
+@lit/reactive-element/decorators/base.js:
+@lit/reactive-element/decorators/query.js:
+@lit/reactive-element/decorators/query-all.js:
+@lit/reactive-element/decorators/query-async.js:
+@lit/reactive-element/decorators/query-assigned-nodes.js:
+lit-html/directive.js:
+lit-html/directives/repeat.js:
+lit-html/async-directive.js:
+lit-html/directives/cache.js:
+lit-html/directives/unsafe-html.js:
+lit-html/directives/unsafe-svg.js:
+  /**
+   * @license
+   * Copyright 2017 Google LLC
+   * SPDX-License-Identifier: BSD-3-Clause
+   */
+
+@lit/context/lib/decorators/consume.js:
+lit-html/is-server.js:
+  /**
+   * @license
+   * Copyright 2022 Google LLC
+   * SPDX-License-Identifier: BSD-3-Clause
+   */
+
+@lit/reactive-element/css-tag.js:
+  /**
+   * @license
+   * Copyright 2019 Google LLC
+   * SPDX-License-Identifier: BSD-3-Clause
+   */
+
+lit-html/static.js:
+lit-html/directive-helpers.js:
+lit-html/directives/ref.js:
+lit-html/directives/live.js:
+  /**
+   * @license
+   * Copyright 2020 Google LLC
+   * SPDX-License-Identifier: BSD-3-Clause
+   */
+
+lit-html/directives/style-map.js:
+lit-html/directives/if-defined.js:
+lit-html/directives/class-map.js:
+lit-html/directives/guard.js:
+  /**
+   * @license
+   * Copyright 2018 Google LLC
+   * SPDX-License-Identifier: BSD-3-Clause
+   */
+
+dompurify/dist/purify.es.mjs:
+  /*! @license DOMPurify 3.4.18 | (c) Cure53 and other contributors | Released under the Apache license 2.0 and Mozilla Public License 2.0 | github.com/cure53/DOMPurify/blob/3.4.18/LICENSE */
+  /*! regenerator-runtime -- Copyright (c) 2014-present, Facebook, Inc. -- license (MIT): https://github.com/babel/babel/blob/main/packages/babel-helpers/LICENSE */

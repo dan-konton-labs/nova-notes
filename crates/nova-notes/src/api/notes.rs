@@ -329,7 +329,9 @@ mod tests {
 
         let html = file_note(&app, "page.html", b"<p>x</p>", "text/html", false).await;
         let (_, headers, _) = fetch(&app, &format!("/api/notes/{}/file", html.id)).await;
-        assert_eq!(headers["content-security-policy"], "sandbox");
+        // Uploaded HTML runs nothing and loads nothing remote (no beacons, no images).
+        assert_eq!(headers["content-security-policy"], crate::services::notes::UPLOADED_HTML_CSP_HEADER);
+        assert!(headers["content-security-policy"].to_str().unwrap().contains("default-src 'none'"));
         assert_eq!(headers["content-type"], "text/html; charset=utf-8");
 
         let explainer = file_note(&app, "explainer.html", b"<script></script>", "text/html", true).await;

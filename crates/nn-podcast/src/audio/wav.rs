@@ -7,6 +7,13 @@ const FORMAT_PCM: u16 = 1;
 const FORMAT_IEEE_FLOAT: u16 = 3;
 const FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 
+/// Highest sample rate [`concat`] accepts; the gap's size follows from it.
+const MAX_JOIN_SAMPLE_RATE: u32 = 192_000;
+/// Most channels [`concat`] accepts (WAVE_FORMAT_EXTENSIBLE names 18).
+const MAX_JOIN_CHANNELS: u16 = 32;
+/// Largest sample size in bytes (64-bit float), for the block align check.
+const MAX_BYTES_PER_SAMPLE: u32 = 8;
+
 /// What the `fmt ` chunk says, plus where the samples are.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WavInfo {
@@ -143,10 +150,39 @@ pub(crate) fn concat(clips: &[Vec<u8>], gap_ms: u32) -> Result<Vec<u8>, String> 
         }
     }
 
+    // The header comes from the clip: bound what it can make us allocate.
+    if format.sample_rate > MAX_JOIN_SAMPLE_RATE {
+        return Err(format!(
+            "the sample rate {} Hz is above the {MAX_JOIN_SAMPLE_RATE} Hz this joiner accepts",
+            format.sample_rate
+        ));
+    }
+    if format.channels > MAX_JOIN_CHANNELS {
+        return Err(format!("{} channels is more than the {MAX_JOIN_CHANNELS} this joiner accepts", format.channels));
+    }
+    if u32::from(format.block_align) > u32::from(format.channels) * MAX_BYTES_PER_SAMPLE {
+        return Err("the WAV format chunk is invalid (block align too large)".into());
+    }
+    let too_large = || "the combined audio is too large for a WAV file (4 GB limit)".to_string();
+    let gap_ms = if infos.len() > 1 { gap_ms } else { 0 };
     let gap_frames = u64::from(format.sample_rate) * u64::from(gap_ms) / 1000;
-    let gap = vec![format.silence_byte(); gap_frames as usize * usize::from(format.block_align)];
+    let gap_bytes = gap_frames.checked_mul(u64::from(format.block_align)).ok_or_else(too_large)?;
+    let total = infos
+        .iter()
+        .map(|info| info.data.len() as u64)
+        .try_fold(0u64, u64::checked_add)
+        .and_then(|data| gap_bytes.checked_mul(infos.len() as u64 - 1)?.checked_add(data))
+        .filter(|&total| total <= u64::from(u32::MAX))
+        .ok_or_else(too_large)?;
+    let out_of_memory = |_| "not enough memory to join the clips".to_string();
+    let gap_bytes = usize::try_from(gap_bytes).map_err(|_| too_large())?;
+    let total = usize::try_from(total).map_err(|_| too_large())?;
+    let mut gap = Vec::new();
+    gap.try_reserve_exact(gap_bytes).map_err(out_of_memory)?;
+    gap.resize(gap_bytes, format.silence_byte());
 
-    let mut samples = Vec::with_capacity(clips.iter().map(Vec::len).sum::<usize>());
+    let mut samples = Vec::new();
+    samples.try_reserve_exact(total).map_err(out_of_memory)?;
     for (index, (clip, info)) in clips.iter().zip(&infos).enumerate() {
         if index > 0 {
             samples.extend_from_slice(&gap);
@@ -157,11 +193,11 @@ pub(crate) fn concat(clips: &[Vec<u8>], gap_ms: u32) -> Result<Vec<u8>, String> 
     let fmt_padding = format.fmt.len() & 1;
     let data_padding = samples.len() & 1;
     let riff_size = 4 + (8 + format.fmt.len() + fmt_padding) + (8 + samples.len() + data_padding);
-    let too_large = || "the combined audio is too large for a WAV file (4 GB limit)".to_string();
     let riff_size = u32::try_from(riff_size).map_err(|_| too_large())?;
     let data_size = u32::try_from(samples.len()).map_err(|_| too_large())?;
 
-    let mut out = Vec::with_capacity(riff_size as usize + 8);
+    let mut out = Vec::new();
+    out.try_reserve_exact(riff_size as usize + 8).map_err(out_of_memory)?;
     out.extend_from_slice(b"RIFF");
     out.extend_from_slice(&riff_size.to_le_bytes());
     out.extend_from_slice(b"WAVE");
@@ -296,6 +332,37 @@ mod tests {
         assert_eq!(info.data.len(), 3 * 32 + 2 * 8_000);
         assert!(joined[info.data.start + 32..info.data.start + 32 + 8_000].iter().all(|&b| b == 0));
         assert_eq!(info.duration_seconds(), (24.0 + 4_000.0) / 8_000.0);
+    }
+
+    /// Issue #34: a header claiming a 4 GHz rate and a 65535-byte block align
+    /// used to size the gap at about 10^14 bytes and abort the process.
+    #[test]
+    fn concat_refuses_headers_that_would_need_huge_buffers() {
+        let mut absurd = pcm16(24_000, 1, &[1, 2]);
+        absurd[24..28].copy_from_slice(&4_000_000_000u32.to_le_bytes());
+        absurd[32..34].copy_from_slice(&u16::MAX.to_le_bytes());
+        let error = concat(&[absurd.clone(), absurd], 400).unwrap_err();
+        assert!(error.contains("sample rate"), "{error}");
+
+        let mut wide = pcm16(48_000, 1, &[1, 2]);
+        wide[32..34].copy_from_slice(&u16::MAX.to_le_bytes());
+        let error = concat(&[wide.clone(), wide], 400).unwrap_err();
+        assert!(error.contains("block align"), "{error}");
+
+        let mut crowded = pcm16(48_000, 1, &[1, 2]);
+        crowded[22..24].copy_from_slice(&u16::MAX.to_le_bytes());
+        crowded[32..34].copy_from_slice(&u16::MAX.to_le_bytes());
+        let error = concat(&[crowded], 400).unwrap_err();
+        assert!(error.contains("channels"), "{error}");
+
+        // One clip needs no gap, however long the gap setting.
+        let single = concat(&[pcm16(MAX_JOIN_SAMPLE_RATE, 2, &[1, 2])], u32::MAX).unwrap();
+        assert_eq!(parse(&single).unwrap().data.len(), 4);
+
+        // A legal format with an absurd gap is refused before allocating.
+        let clip = pcm16(MAX_JOIN_SAMPLE_RATE, 2, &[1, 2]);
+        let error = concat(&[clip.clone(), clip], u32::MAX).unwrap_err();
+        assert!(error.contains("too large"), "{error}");
     }
 
     #[test]

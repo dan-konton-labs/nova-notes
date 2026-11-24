@@ -11,7 +11,7 @@ use url::Url;
 use super::detect::{self, FileKind};
 use super::engines::{self, EnginePage};
 use super::fetch::{self, Fetched};
-use super::html::{html_to_markdown, HtmlOptions};
+use super::html::{html_to_markdown_blocking, HtmlOptions};
 use super::{documents, files, ExtractContext, Extracted, UrlEngine};
 use crate::error::ContentError;
 
@@ -156,7 +156,8 @@ async fn extract_fetched(fetched: Fetched, ctx: &ExtractContext) -> Result<Extra
     if is_html {
         let charset = fetched.charset.clone().or_else(|| meta_charset(&fetched.body));
         let html = documents::decode_with_charset(&fetched.body, charset.as_deref());
-        let page = html_to_markdown(&html, &HtmlOptions { base_url: Some(fetched.final_url.clone()), main_content: true });
+        let options = HtmlOptions { base_url: Some(fetched.final_url.clone()), main_content: true };
+        let page = html_to_markdown_blocking(html, options).await?;
 
         let mut metadata = Map::new();
         metadata.insert("engine".to_string(), json!("simple"));

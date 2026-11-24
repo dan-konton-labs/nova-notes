@@ -2,6 +2,11 @@
 (function () {
   "use strict";
 
+  // Nothing here uses hx-on, js: values or trigger filters; with eval off,
+  // injected markup cannot run code through htmx attributes (the page CSP
+  // blocks eval as well).
+  if (window.htmx) window.htmx.config.allowEval = false;
+
   // Theme: follows the system unless the user picked one.
   var root = document.documentElement;
   var saved = null;

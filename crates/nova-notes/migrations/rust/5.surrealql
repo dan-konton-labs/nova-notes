@@ -1,0 +1,6 @@
+-- Web UI sign-in sessions. Additive and idempotent; the Python build never
+-- reads it. The record key is a SHA-256 of the session id in the cookie (the
+-- id itself is never stored); `binding` ties the row to the password in use
+-- when it was made; `expires` is enforced by the server.
+DEFINE TABLE IF NOT EXISTS login_session SCHEMALESS;
+DEFINE INDEX IF NOT EXISTS idx_login_session_expires ON TABLE login_session COLUMNS expires;

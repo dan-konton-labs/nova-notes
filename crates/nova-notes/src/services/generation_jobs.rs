@@ -294,6 +294,8 @@ pub(crate) async fn submit_generation(
             status: "queued".into(),
             notebook_id: notebook_id.to_string(),
         }),
+        // A full queue is the caller's cue to retry later: keep the 429.
+        Err(e @ AppError::RateLimit(_)) => Err(e),
         Err(e) => {
             tracing::error!("Failed to submit {command_name} job: {e}");
             Err(AppError::http(

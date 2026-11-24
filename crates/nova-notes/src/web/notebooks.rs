@@ -727,7 +727,7 @@ async fn note_page_in_notebook(state: &AppState, notebook_id: &str, note: &NoteV
 
 /// Restores the saved pane layout (`nn-nb-cols` in localStorage) onto the `.nb-cols` element that contains
 /// this script. `notebooks.js` writes the key and handles the toggles.
-const COLUMNS_INIT: &str = r#"(function(){var el=document.currentScript.parentElement;try{var s=JSON.parse(localStorage.getItem("nn-nb-cols")||"null");if(s){["sources","notes","chat"].forEach(function(k){if(s[k]==="open"||s[k]==="closed")el.setAttribute("data-"+k,s[k]);});}}catch(e){}})();"#;
+pub(crate) const COLUMNS_INIT: &str = r#"(function(){var el=document.currentScript.parentElement;try{var s=JSON.parse(localStorage.getItem("nn-nb-cols")||"null");if(s){["sources","notes","chat"].forEach(function(k){if(s[k]==="open"||s[k]==="closed")el.setAttribute("data-"+k,s[k]);});}}catch(e){}})();"#;
 
 const ICON_LEFT: &str = r#"<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3.5 5.5 8l4.5 4.5"/></svg>"#;
 const ICON_RIGHT: &str = r#"<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5"/></svg>"#;
@@ -1726,7 +1726,7 @@ async fn get_note_blob(State(state): State<AppState>, Path(key): Path<String>) -
         (header::CONTENT_TYPE, HeaderValue::from_str(&blob.mime).unwrap_or(HeaderValue::from_static("application/octet-stream"))),
         (header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=31536000, immutable")),
         (header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")),
-        (header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'")),
+        (header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(crate::services::notes::UPLOADED_HTML_CSP_HEADER)),
         (header::CONTENT_DISPOSITION, HeaderValue::from_static(if inline { "inline" } else { "attachment" })),
     ];
     Ok((headers, blob.data).into_response())

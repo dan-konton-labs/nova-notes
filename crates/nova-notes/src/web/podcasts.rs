@@ -1820,7 +1820,7 @@ fn feed_settings_card(settings: &FeedSettingsView) -> Markup {
 }
 
 async fn feed_page(State(state): State<AppState>, headers: HeaderMap) -> WebResult<Markup> {
-    let url = podcast_feed::feed_url(&state, &forwarded_origin(&headers)).await.map(|u| u.feed_url);
+    let url = podcast_feed::feed_url(&state, &forwarded_origin(&state.config, &headers)).await.map(|u| u.feed_url);
     let settings = podcast_feed::feed_settings(&state).await?;
     let ctx = PageContext::new(&state, "/podcasts/feed");
     Ok(page(&ctx, "Podcast feed", html! {
@@ -1834,7 +1834,7 @@ async fn feed_page(State(state): State<AppState>, headers: HeaderMap) -> WebResu
 }
 
 async fn rotate_feed(State(state): State<AppState>, headers: HeaderMap) -> WebResult<Response> {
-    let url = podcast_feed::rotate_feed_url(&state, &forwarded_origin(&headers)).await?;
+    let url = podcast_feed::rotate_feed_url(&state, &forwarded_origin(&state.config, &headers)).await?;
     if is_htmx(&headers) {
         return Ok(with_toast(feed_url_card(Ok(url.feed_url)).into_response(), "Feed link rotated. Follow the new link in your podcast app."));
     }
@@ -2481,7 +2481,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_private_feed_page() {
-        let app = TestApp::new().await;
+        let app = crate::api::podcast_feed::tests::proxied_app().await;
         // No HTTPS address: the page explains what to set.
         let (status, body) = page(&app, "/podcasts/feed").await;
         assert_eq!(status, StatusCode::OK);

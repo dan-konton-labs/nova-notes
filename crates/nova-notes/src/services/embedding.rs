@@ -89,8 +89,10 @@ pub async fn embed_item(state: &AppState, request: &EmbedRequest) -> AppResult<E
         } else {
             ("embed_note", json!({ "note_id": item_id }))
         };
-        let command_id = state.jobs.submit(name, args).await.map_err(|e| {
-            AppError::http(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to queue embedding: {e}"))
+        let command_id = state.jobs.submit(name, args).await.map_err(|e| match e {
+            // A full queue is the caller's cue to retry later: keep the 429.
+            AppError::RateLimit(_) => e,
+            e => AppError::http(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to queue embedding: {e}")),
         })?;
         tracing::info!("Submitted async {name} command: {command_id}");
         return Ok(result("Embedding queued for background processing", Some(command_id)));

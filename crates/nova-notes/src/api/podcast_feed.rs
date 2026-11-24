@@ -20,6 +20,7 @@ use axum::Router;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
+use crate::config::Config;
 use crate::error::{AppError, AppResult};
 use crate::services::podcast_feed::{self, feed_not_found, ForwardedOrigin};
 use crate::services::podcasts::ServedFile;
@@ -31,10 +32,12 @@ pub fn router() -> Router<AppState> {
         .route("/podcasts/feed/{token}/episodes/{filename}", get(feed_episode_audio))
 }
 
-/// The forwarded headers the public address may come from.
-pub(crate) fn forwarded_origin(headers: &HeaderMap) -> ForwardedOrigin {
-    let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(String::from);
-    ForwardedOrigin { proto: text("x-forwarded-proto"), host: text("x-forwarded-host") }
+/// The request's own address, the last resort for the feed's public address.
+/// Forwarded headers count only behind a trusted proxy (see
+/// [`crate::api::perimeter::request_origin`]).
+pub(crate) fn forwarded_origin(config: &Config, headers: &HeaderMap) -> ForwardedOrigin {
+    let origin = crate::api::perimeter::request_origin(config, headers);
+    ForwardedOrigin { proto: Some(if origin.https { "https" } else { "http" }.into()), host: origin.host }
 }
 
 /// `feed.xml` or `artwork.<ext>`; any other name is the uniform 404.
@@ -47,12 +50,14 @@ async fn feed_document_or_artwork(
         return Err(feed_not_found());
     };
     if name == "feed.xml" {
-        let xml = podcast_feed::feed_xml(&state, &token, &forwarded_origin(&headers)).await?;
+        let xml = podcast_feed::feed_xml(&state, &token, &forwarded_origin(&state.config, &headers)).await?;
         let length = xml.len();
         return Ok((
             [
                 (header::CONTENT_TYPE, HeaderValue::from_static(nn_podcast::feed::FEED_MEDIA_TYPE)),
                 (header::CONTENT_LENGTH, HeaderValue::from(length)),
+                // The links carry the Feed Token: no shared cache may keep it.
+                (header::CACHE_CONTROL, HeaderValue::from_static("private")),
             ],
             xml,
         )
@@ -212,6 +217,16 @@ pub(crate) mod tests {
     pub(crate) const HOST: &str = "lab.example.ts.net:8502";
     pub(crate) const BASE: &str = "https://lab.example.ts.net:8502";
 
+    /// An app behind a trusted proxy answering to [`HOST`], so the
+    /// forwarded headers [`forwarded`] sends decide the feed's address.
+    pub(crate) async fn proxied_app() -> TestApp {
+        TestApp::with_config(|config| {
+            config.trust_proxy_headers = true;
+            config.allowed_hosts.push("lab.example.ts.net".into());
+        })
+        .await
+    }
+
     /// A request carrying the forwarded headers the public address comes from.
     pub(crate) fn forwarded(method: Method, path: &str) -> Request<Body> {
         Request::builder()
@@ -293,7 +308,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn feed_answers_a_valid_token_and_a_uniform_404_otherwise() {
-        let app = TestApp::new().await;
+        let app = proxied_app().await;
         let token = token(&app).await;
         let feed = format!("/api/podcasts/feed/{token}/feed.xml");
 
@@ -341,16 +356,66 @@ pub(crate) mod tests {
         }
     }
 
+    /// Without `OPEN_NOTEBOOK_TRUST_PROXY_HEADERS`, a client cannot put a host
+    /// of its choosing (and so the Feed Token) into the feed's links.
+    #[tokio::test]
+    async fn forwarded_headers_count_only_behind_a_trusted_proxy() {
+        if std::env::var("OPEN_NOTEBOOK_PUBLIC_URL").is_ok() || std::env::var("API_URL").is_ok() {
+            return;
+        }
+        let app = TestApp::with_config(|config| config.allowed_hosts.push("lab.example.ts.net".into())).await;
+        let token = token(&app).await;
+        let forged = |path: &str| {
+            Request::builder()
+                .uri(path)
+                .header("x-forwarded-proto", "https")
+                .header("x-forwarded-host", "evil.example")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let (status, _, body) = read(&app, forged(&format!("/api/podcasts/feed/{token}/feed.xml"))).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let body = String::from_utf8(body).unwrap();
+        assert!(!body.contains("evil.example") && body.contains("OPEN_NOTEBOOK_TRUST_PROXY_HEADERS"), "{body}");
+        let (status, _, body) = read(&app, forged("/api/podcasts/feed-url")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!String::from_utf8(body).unwrap().contains("evil.example"));
+
+        // Behind a trusted proxy the forwarded host still has to be one of ours.
+        let app = proxied_app().await;
+        let (status, _, body) = read(&app, forged("/api/podcasts/feed-url")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!String::from_utf8(body).unwrap().contains("evil.example"));
+        let (status, _, body) = read(&app, forwarded(Method::GET, "/api/podcasts/feed-url")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(String::from_utf8(body).unwrap().contains(BASE));
+    }
+
+    /// The feed carries the Feed Token, so no shared cache may keep it; audio
+    /// and artwork are never content-sniffed.
+    #[tokio::test]
+    async fn feed_responses_are_private_and_never_sniffed() {
+        let app = proxied_app().await;
+        let token = token(&app).await;
+        let (status, headers, _) = read(&app, forwarded(Method::GET, &format!("/api/podcasts/feed/{token}/feed.xml"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["cache-control"], "private");
+        episode_with_audio(&app, "ep1", "episodes/ep1/audio/ep1.mp3", &silent_mp3_frames(5), Some(Utc::now())).await;
+        let (status, headers, _) = read(&app, forwarded(Method::GET, &format!("/api/podcasts/feed/{token}/episodes/ep1.mp3"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+    }
+
     #[tokio::test]
     async fn no_token_configured_looks_like_a_wrong_token() {
-        let app = TestApp::new().await;
+        let app = proxied_app().await;
         let (status, body) = app.get("/api/podcasts/feed/anything/feed.xml").await;
         assert_eq!((status, body), (StatusCode::NOT_FOUND, json!({ "detail": "Not found" })));
     }
 
     #[tokio::test]
     async fn published_episodes_become_items_newest_first() {
-        let app = TestApp::new().await;
+        let app = proxied_app().await;
         let token = token(&app).await;
         let audio = silent_mp3_frames(20);
         let now = Utc::now();
@@ -398,7 +463,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn episode_audio_supports_ranges_head_and_uniform_404s() {
-        let app = TestApp::new().await;
+        let app = proxied_app().await;
         let token = token(&app).await;
         let audio: Vec<u8> = (0..12_000u32).map(|i| (i % 251) as u8).collect();
         episode_with_audio(&app, "ep1", "episodes/ep1/audio/ep1.mp3", &audio, Some(Utc::now())).await;
@@ -461,7 +526,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn the_feed_needs_no_password_but_everything_else_does() {
-        let app = TestApp::new().await;
+        let app = proxied_app().await;
         let token = token(&app).await;
         episode_with_audio(&app, "ep1", "episodes/ep1/audio/ep1.mp3", &silent_mp3_frames(5), Some(Utc::now())).await;
         let router = router_with_password(&app, "hunter2");

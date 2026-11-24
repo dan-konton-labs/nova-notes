@@ -568,13 +568,25 @@ pub struct SourceUpload {
     pub data: Vec<u8>,
 }
 
+/// Refuse text content longer than `OPEN_NOTEBOOK_MAX_TEXT_SOURCE_CHARS`
+/// (400): it is stored in the job arguments as well as on the source.
+fn check_text_length(config: &Config, text: &str) -> AppResult<()> {
+    let max = config.max_text_source_chars;
+    if text.chars().count() > max {
+        return Err(AppError::bad_request(format!(
+            "Text content is too long ({max} characters at most; set OPEN_NOTEBOOK_MAX_TEXT_SOURCE_CHARS to change the limit)."
+        )));
+    }
+    Ok(())
+}
+
 /// Check the type-specific input and build the job's `content_state`. The
 /// SSRF and uploads-directory guards run here (and again in the job).
 async fn build_content_state(state: &AppState, new: &NewSource, uploaded: Option<&Path>) -> AppResult<ContentState> {
     match new.source_type.as_str() {
         "link" => {
             let url = new.url.clone().filter(|u| !u.is_empty()).ok_or_else(|| AppError::bad_request("URL is required for link type"))?;
-            nn_content::validate_url(&url).await.map_err(|e| AppError::bad_request(e.to_string()))?;
+            validate_source_url(&state.config, &url).await.map_err(|e| AppError::bad_request(e.to_string()))?;
             Ok(ContentState { url: Some(url), ..ContentState::default() })
         }
         "upload" => {
@@ -591,6 +603,7 @@ async fn build_content_state(state: &AppState, new: &NewSource, uploaded: Option
         "text" => {
             let content =
                 new.content.clone().filter(|c| !c.is_empty()).ok_or_else(|| AppError::bad_request("Content is required for text type"))?;
+            check_text_length(&state.config, &content)?;
             Ok(ContentState { content: Some(content), ..ContentState::default() })
         }
         _ => Err(AppError::bad_request("Invalid source type. Must be link, upload, or text")),
@@ -749,11 +762,13 @@ pub async fn retry_source(state: &AppState, id: &str) -> AppResult<SourceView> {
     let file_path = source.asset.as_ref().and_then(|a| a.file_path.clone()).filter(|p| !p.is_empty());
     let url = source.asset.as_ref().and_then(|a| a.url.clone()).filter(|u| !u.is_empty());
     let content_state = if let Some(file_path) = file_path {
-        assert_file_supported(Path::new(&file_path)).await?;
+        let resolved = confine_to_uploads(&state.config, &file_path)?;
+        assert_file_supported(&resolved).await?;
         ContentState { file_path: Some(file_path), delete_source: Some(false), ..ContentState::default() }
     } else if let Some(url) = url {
         ContentState { url: Some(url), ..ContentState::default() }
     } else if let Some(text) = source.full_text.clone().filter(|t| !t.is_empty()) {
+        check_text_length(&state.config, &text)?;
         ContentState { content: Some(text), ..ContentState::default() }
     } else {
         return Err(AppError::bad_request("Cannot determine source content for retry"));
@@ -768,6 +783,8 @@ pub async fn retry_source(state: &AppState, id: &str) -> AppResult<SourceView> {
     });
     let command_id = match state.jobs.submit("process_source", args).await {
         Ok(command_id) => command_id,
+        // A full queue is the caller's cue to retry later: keep the 429.
+        Err(e @ AppError::RateLimit(_)) => return Err(e),
         Err(e) => {
             tracing::error!("Failed to submit retry processing command for source {id}: {e}");
             return Err(AppError::http(StatusCode::INTERNAL_SERVER_ERROR, "Failed to queue retry processing"));
@@ -821,7 +838,11 @@ pub async fn extraction_context(state: &AppState) -> nn_content::ExtractContext 
             ContentSettings::default()
         }
     };
-    let mut ctx = nn_content::ExtractContext { client: state.http.clone(), ..nn_content::ExtractContext::default() };
+    let mut ctx = nn_content::ExtractContext {
+        client: state.http.clone(),
+        url_policy: state.config.source_url_policy,
+        ..nn_content::ExtractContext::default()
+    };
 
     let url_engine = usable_engine(settings.default_content_processing_engine_url.as_deref(), "url");
     if let Some(engine) = url_engine.as_deref() {
@@ -885,9 +906,15 @@ pub async fn validate_content_state(config: &Config, content_state: &ContentStat
         }
     }
     if let Some(url) = content_state.url.as_deref().filter(|u| !u.is_empty()) {
-        nn_content::validate_url(url).await.map_err(|e| AppError::invalid(e.to_string()))?;
+        validate_source_url(config, url).await.map_err(|e| AppError::invalid(e.to_string()))?;
     }
     Ok(())
+}
+
+/// The SSRF guard for a source URL, under `OPEN_NOTEBOOK_SOURCE_URL_POLICY`.
+async fn validate_source_url(config: &Config, url: &str) -> Result<(), nn_content::UrlValidationError> {
+    nn_content::url_validation::validate_url_with(url, &config.source_url_policy, &nn_content::url_validation::SystemResolver)
+        .await
 }
 
 /// Extract the content a `content_state` names. Every extraction failure is
@@ -1092,6 +1119,36 @@ mod tests {
         let link_local = ContentState { url: Some("http://169.254.169.254/latest/meta-data/".into()), ..ContentState::default() };
         let error = validate_content_state(config, &link_local).await.unwrap_err();
         assert!(error.detail().contains("Link-local") || error.detail().to_lowercase().contains("link-local"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn source_url_policy_defaults_to_public_only_with_a_self_hosted_opt_out() {
+        let (state, _dir) = AppState::for_tests().await.unwrap();
+        let link = |url: &str| ContentState { url: Some(url.into()), ..ContentState::default() };
+        let internal = ["http://127.0.0.1:11434/api/tags", "http://10.0.0.1/", "http://100.64.0.1/", "http://0.0.0.0/"];
+
+        let mut strict = (*state.config).clone();
+        strict.source_url_policy = crate::config::parse_source_url_policy(None);
+        for url in internal {
+            let error = validate_content_state(&strict, &link(url)).await.unwrap_err();
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{url}");
+            assert!(error.detail().contains("rivate"), "{url}: {error}");
+        }
+        validate_content_state(&strict, &link("http://8.8.8.8/")).await.unwrap();
+
+        let mut lan = (*state.config).clone();
+        lan.source_url_policy = crate::config::parse_source_url_policy(Some("self_hosted"));
+        for url in internal {
+            validate_content_state(&lan, &link(url)).await.unwrap_or_else(|e| panic!("{url}: {e}"));
+        }
+        // Metadata addresses stay refused under the opt-out.
+        for url in ["http://169.254.169.254/latest/", "http://100.100.100.200/", "http://168.63.129.16/"] {
+            assert!(validate_content_state(&lan, &link(url)).await.is_err(), "{url}");
+        }
+        // The pipeline's extraction context (every fetch hop) carries the policy too.
+        let (strict_state, _strict_dir) =
+            AppState::for_tests_with(|c| c.source_url_policy = nn_content::UrlPolicy::public_only()).await.unwrap();
+        assert_eq!(extraction_context(&strict_state).await.url_policy, nn_content::UrlPolicy::public_only());
     }
 
     #[test]
