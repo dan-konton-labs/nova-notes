@@ -24,6 +24,10 @@ base64.workspace = true
 
 # HTML parsing and charset decoding
 scraper = { version = "0.29", default-features = false }
+# The parser and tree scraper is built on, used directly to bound parsing of
+# hostile pages (nesting depth, element count). Same versions scraper uses.
+html5ever = "0.40"
+ego-tree = "0.11"
 encoding_rs = "0.8"
 
 # Documents (all pure Rust)

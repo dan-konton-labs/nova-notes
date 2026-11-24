@@ -57,9 +57,12 @@ fn scalar(value: &Value) -> Option<String> {
 pub(crate) fn parse_error_body(body: &str) -> ErrorBody {
     let trimmed = body.trim();
     let Ok(json) = serde_json::from_str::<Value>(trimmed) else {
-        // HTML error pages from proxies carry no useful message.
-        let message = if trimmed.starts_with('<') { String::new() } else { truncate(trimmed, MAX_MESSAGE_CHARS) };
-        return ErrorBody { message, codes: String::new() };
+        // A body that is not a JSON error object is never passed on: it may
+        // be any page the configured URL serves (an internal service, an HTML
+        // error page). The caller logs it and reports the status only; the
+        // text still feeds classification ("context length exceeded").
+        let codes = if trimmed.starts_with('<') { String::new() } else { truncate(trimmed, MAX_MESSAGE_CHARS) };
+        return ErrorBody { message: String::new(), codes };
     };
     // Gemini streaming endpoints wrap the error object in an array.
     let json = match json {
@@ -183,6 +186,14 @@ fn status_reason(status: u16) -> &'static str {
 /// so [`http_status`] can recover the status from any variant.
 pub(crate) fn http_error(provider: &str, status: u16, body: &str, secret: Option<&str>) -> AiError {
     let parsed = parse_error_body(body);
+    if parsed.message.is_empty() && !body.trim().is_empty() {
+        tracing::debug!(
+            provider,
+            status,
+            body = %redact(&truncate(body.trim(), MAX_MESSAGE_CHARS), secret),
+            "provider error response without a JSON message"
+        );
+    }
     let detail = if parsed.message.is_empty() { status_reason(status).to_string() } else { parsed.message };
     let detail = redact(&detail, secret);
     let message = format!("{provider}: {detail} (HTTP {status})");
@@ -334,7 +345,8 @@ mod tests {
             (r#"{"detail":[{"loc":["body"],"msg":"field required"},{"msg":"bad value"}]}"#, "field required; bad value"),
             (r#"{"err_code":"INVALID_AUTH","err_msg":"Invalid credentials."}"#, "Invalid credentials."),
             (r#"{"base_resp":{"status_code":1004,"status_msg":"login fail"}}"#, "login fail"),
-            ("upstream connect error", "upstream connect error"),
+            // Plain text is never reflected (it may be any page the URL serves).
+            ("upstream connect error", ""),
             ("<html><body>502 Bad Gateway</body></html>", ""),
         ];
         for (body, expected) in cases {
@@ -342,6 +354,14 @@ mod tests {
         }
         let parsed = parse_error_body(r#"{"error":{"message":"m","type":"t","code":"c"}}"#);
         assert_eq!(parsed.codes, "t c");
+    }
+
+    #[test]
+    fn non_json_bodies_are_not_reflected_but_still_classify() {
+        let err = classify(500, "root:x:0:0:internal-service-secret");
+        assert_eq!(err.to_string(), "openai: internal server error (HTTP 500)");
+        assert!(matches!(classify(400, "input exceeds the token limit"), AiError::ContextLength(_)));
+        assert_eq!(classify(400, "input exceeds the token limit").to_string(), "openai: bad request (HTTP 400)");
     }
 
     #[test]

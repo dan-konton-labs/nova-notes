@@ -4,8 +4,10 @@
 use std::io::Read;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use serde_json::{json, Value};
+use tokio::sync::Semaphore;
 
 use super::detect::{self, Detected, FileKind};
 use super::{documents, media, ExtractContext, Extracted};
@@ -96,14 +98,31 @@ pub(crate) async fn extract_file(
     }
 }
 
-async fn run_blocking<T, F>(work: F) -> Result<T, ContentError>
+/// Run a CPU-heavy parser (documents, HTML conversion) on a blocking thread.
+///
+/// At most one such job per CPU runs at a time; the rest wait here. The
+/// permit lives inside the blocking closure, so a caller that stops waiting
+/// (a timeout) does not free the slot while the parser is still running.
+pub(crate) async fn run_blocking<T, F>(work: F) -> Result<T, ContentError>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, ContentError> + Send + 'static,
 {
-    tokio::task::spawn_blocking(work)
+    static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    let slots = SLOTS.get_or_init(|| {
+        let cpus = std::thread::available_parallelism().map_or(2, usize::from);
+        Arc::new(Semaphore::new(cpus.max(2)))
+    });
+    let permit = Arc::clone(slots)
+        .acquire_owned()
         .await
-        .unwrap_or_else(|e| Err(ContentError::FileOperation(format!("file processing task failed: {e}"))))
+        .map_err(|_| ContentError::FileOperation("file processing is shutting down".to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .unwrap_or_else(|e| Err(ContentError::FileOperation(format!("file processing task failed: {e}"))))
 }
 
 #[cfg(test)]

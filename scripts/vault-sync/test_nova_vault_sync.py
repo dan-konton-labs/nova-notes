@@ -257,5 +257,100 @@ class Scope(unittest.TestCase):
                 nvs.fetch_tree("http://nova", "OtherFolder")
 
 
+
+def fake_response(body):
+    import io
+    import unittest.mock as mock
+
+    data = json.dumps(body).encode()
+    return mock.MagicMock(__enter__=lambda s: io.BytesIO(data), __exit__=lambda *a: False)
+
+
+class NovaAccess(unittest.TestCase):
+    """Talking to a Nova Notes that has OPEN_NOTEBOOK_PASSWORD set."""
+
+    TREE = {"folder": "NovaNotes", "files": [{"path": "NovaNotes/ok.md", "content": "x", "mtime": 1}]}
+
+    def fetch(self, token):
+        import unittest.mock as mock
+
+        with mock.patch("urllib.request.urlopen", return_value=fake_response(self.TREE)) as urlopen:
+            nvs.fetch_tree("http://127.0.0.1:5055", "NovaNotes", token)
+        return urlopen.call_args[0][0]
+
+    def test_the_token_is_sent_as_a_bearer_and_not_carried_across_redirects(self):
+        request = self.fetch("s3cret")
+        self.assertEqual(request.unredirected_hdrs.get("Authorization"), "Bearer s3cret")
+        self.assertNotIn("Authorization", request.headers)
+        self.assertEqual(request.get_header("Authorization"), "Bearer s3cret")
+
+    def test_no_token_sends_no_header(self):
+        self.assertIsNone(self.fetch(None).get_header("Authorization"))
+
+    def test_the_token_comes_from_the_environment_or_a_private_file(self):
+        self.assertEqual(nvs.load_token(environ={nvs.TOKEN_ENV: " s3cret\n"}), "s3cret")
+        self.assertIsNone(nvs.load_token(environ={}))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "token"
+            path.write_text("from-file\n")
+            os.chmod(path, 0o644)
+            with self.assertRaises(nvs.Refused):
+                nvs.load_token(path, environ={})
+            os.chmod(path, 0o600)
+            self.assertEqual(nvs.load_token(path, environ={nvs.TOKEN_ENV: "ignored"}), "from-file")
+            with self.assertRaises(nvs.Refused):
+                nvs.load_token(Path(tmp) / "missing", environ={})
+        with self.assertRaises(nvs.Refused):
+            nvs.load_token(environ={nvs.TOKEN_ENV: "two words"})
+
+    def test_plain_http_is_only_for_loopback_unless_allowed(self):
+        for url in ["http://127.0.0.1:5055", "http://localhost:5055", "http://[::1]:5055", "https://notes.example.ts.net"]:
+            nvs.check_nova_url(url)
+        for url in ["http://notes.example.ts.net:5055", "http://192.168.1.20:5055", "ftp://127.0.0.1", "127.0.0.1:5055"]:
+            with self.assertRaises(nvs.Refused, msg=url):
+                nvs.check_nova_url(url)
+        nvs.check_nova_url("http://notes.example.ts.net:5055", allow_insecure_http=True)
+
+    def test_a_401_is_reported_without_the_token(self):
+        import io
+        import unittest.mock as mock
+        import urllib.error
+
+        error = urllib.error.HTTPError("http://127.0.0.1:5055", 401, "Unauthorized", {}, io.BytesIO(b""))
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Path(tmp) / "settings.json"
+            settings.write_text(json.dumps({"couchDB_DBNAME": "vault", "encrypt": True, "passphrase": "p"}))
+            os.chmod(settings, 0o600)
+            with mock.patch("urllib.request.urlopen", side_effect=error), mock.patch("sys.stdout", out), \
+                    mock.patch.dict(os.environ, {nvs.TOKEN_ENV: "s3cret"}), mock.patch("sys.stderr", io.StringIO()):
+                code = nvs.main(["--writer", tmp, "--expect-db", "vault"])
+        self.assertEqual(code, 1)
+        self.assertIn("401", out.getvalue())
+        self.assertNotIn("s3cret", out.getvalue())
+
+
+class Hardening(Case):
+    def test_every_new_directory_level_is_private(self):
+        old_umask = os.umask(0o022)
+        try:
+            self.run_sync([file("NovaNotes/Deep/Er/a.md", "one", 1)])
+            self.fake.edit("NovaNotes/Deep/Er/a.md", "obsidian")
+            self.run_sync([file("NovaNotes/Deep/Er/a.md", "two", 10**12)])
+            nvs.private_mkdir(self.writer / "db", self.writer)
+        finally:
+            os.umask(old_umask)
+        overwritten = self.writer / "overwritten"
+        dirs = [overwritten, self.writer / "db"] + [p for p in overwritten.rglob("*") if p.is_dir()]
+        self.assertGreater(len(dirs), 4)
+        for path in dirs:
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700, path)
+
+    def test_only_digest_pinned_images_count_as_pinned(self):
+        self.assertFalse(nvs.is_pinned(nvs.DEFAULT_IMAGE))
+        self.assertTrue(nvs.is_pinned("novahq/livesync-cli@sha256:" + "0" * 64))
+        self.assertTrue(nvs.is_pinned("sha256:" + "0" * 64))
+
+
 if __name__ == "__main__":
     unittest.main()

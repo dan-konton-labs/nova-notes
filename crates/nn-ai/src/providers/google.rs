@@ -133,8 +133,13 @@ impl GoogleEndpoint {
     }
 
     async fn generate(&self, body: &Value) -> AiResult<Value> {
+        self.generate_capped(body, crate::http::MAX_JSON_RESPONSE_BYTES).await
+    }
+
+    /// `generateContent` with a body limit (speech replies carry base64 audio).
+    async fn generate_capped(&self, body: &Value, cap: usize) -> AiResult<Value> {
         let request = self.post("generateContent", body).await?;
-        self.http.json(request).await
+        self.http.json_capped(request, cap).await
     }
 }
 
@@ -397,7 +402,7 @@ impl TextToSpeechModel for GeminiSpeech {
     }
 
     async fn synthesize(&self, text: &str, voice: &str) -> AiResult<AudioData> {
-        let json = self.endpoint.generate(&speech_body(text, voice)).await?;
+        let json = self.endpoint.generate_capped(&speech_body(text, voice), crate::http::MAX_AUDIO_RESPONSE_BYTES).await?;
         speech_audio(&json).ok_or_else(|| self.endpoint.http.malformed("no audio in the response"))
     }
 

@@ -128,7 +128,7 @@ mod tests {
 
     #[tokio::test]
     async fn settings_default_edit_trim_and_refuse() {
-        let app = TestApp::new().await;
+        let app = crate::api::podcast_feed::tests::proxied_app().await;
         let (status, body) = app.get("/api/podcasts/feed-settings").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["title"], "Open Notebook Podcasts");
@@ -177,7 +177,7 @@ mod tests {
 
     #[tokio::test]
     async fn artwork_upload_preview_and_feed() {
-        let app = TestApp::new().await;
+        let app = crate::api::podcast_feed::tests::proxied_app().await;
         let (status, body) = app.get("/api/podcasts/feed-settings/artwork").await;
         assert_eq!((status, body), (StatusCode::NOT_FOUND, json!({ "detail": "No artwork has been uploaded" })));
 
@@ -221,6 +221,7 @@ mod tests {
             read(&app, forwarded(Method::GET, &format!("/api/podcasts/feed/{token}/artwork.jpg"))).await;
         assert_eq!((status, served.as_slice()), (StatusCode::OK, image.as_slice()));
         assert_eq!(headers["content-type"], "image/jpeg");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
         let (status, _, body) = read(&app, forwarded(Method::HEAD, &format!("/api/podcasts/feed/{token}/artwork.jpg"))).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.is_empty());

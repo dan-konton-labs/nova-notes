@@ -237,6 +237,21 @@ pub fn livesync_docs(config: &VaultConfig, file: &VaultFile) -> (Vec<Json>, Json
 // CouchDB client
 // ---------------------------------------------------------------------------
 
+/// Percent-encode one URL path segment or query value strictly: a space is
+/// `%20` (never `+`, which is literal in a path) and `/` is `%2F`.
+fn encode_component(raw: &str) -> String {
+    // `byte_serialize` encodes everything but `*-._` and alphanumerics, and
+    // writes a space as `+`; a literal `+` comes out as `%2B`, so every `+`
+    // left is a space.
+    url::form_urlencoded::byte_serialize(raw.as_bytes()).collect::<String>().replace('+', "%20")
+}
+
+/// An unreadable CouchDB response body. The parse detail goes to the log.
+fn bad_body(error: reqwest::Error) -> AppError {
+    tracing::warn!("Unreadable vault CouchDB response: {}", error.without_url());
+    AppError::ExternalService("The vault CouchDB returned an unreadable response.".to_string())
+}
+
 /// A thin client for one CouchDB database, built from [`VaultConfig`].
 pub struct Couch {
     client: reqwest::Client,
@@ -259,12 +274,15 @@ impl Couch {
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .map_err(|e| AppError::internal(format!("Could not build the vault HTTP client: {e}")))?;
+        // Credentials left in the URL (a `VaultConfig` not built by
+        // `from_env`) are sent as basic auth, never as part of the URL.
+        let (base, url_user, url_password) = crate::config::split_userinfo(url);
         Ok(Self {
             client,
-            base: url.trim_end_matches('/').to_string(),
+            base: base.trim_end_matches('/').to_string(),
             database: database.to_string(),
-            user: config.user.clone(),
-            password: config.password.clone(),
+            user: config.user.clone().or(url_user),
+            password: config.password.clone().or(url_password),
         })
     }
 
@@ -278,11 +296,15 @@ impl Couch {
 
     /// One percent-encoded document id (slashes in vault paths included).
     fn doc_path(&self, id: &str) -> String {
-        format!("{}/{}", self.database, url::form_urlencoded::byte_serialize(id.as_bytes()).collect::<String>())
+        format!("{}/{}", self.database, encode_component(id))
     }
 
     async fn send(&self, request: reqwest::RequestBuilder) -> AppResult<reqwest::Response> {
-        request.send().await.map_err(|e| AppError::Network(format!("Could not reach the vault CouchDB: {e}")))
+        request.send().await.map_err(|e| {
+            // The detail can name the host and port; it stays in the log.
+            tracing::warn!("Could not reach the vault CouchDB: {}", e.without_url());
+            AppError::Network("Could not reach the vault CouchDB.".to_string())
+        })
     }
 
     /// The database's document count, proving the server answers and the
@@ -304,7 +326,7 @@ impl Couch {
         match response.status() {
             reqwest::StatusCode::NOT_FOUND => Ok(None),
             status if status.is_success() => Ok(Some(
-                response.json().await.map_err(|e| AppError::ExternalService(format!("Bad CouchDB document body: {e}")))?,
+                response.json().await.map_err(bad_body)?,
             )),
             status => Err(AppError::ExternalService(format!("Vault CouchDB answered {status} reading a document"))),
         }
@@ -325,7 +347,7 @@ impl Couch {
         if !status.is_success() {
             return Err(AppError::ExternalService(format!("Vault CouchDB answered {status} reading documents")));
         }
-        let body: Json = response.json().await.map_err(|e| AppError::ExternalService(format!("Bad CouchDB body: {e}")))?;
+        let body: Json = response.json().await.map_err(bad_body)?;
         Ok(body
             .get("rows")
             .and_then(Json::as_array)
@@ -345,7 +367,7 @@ impl Couch {
         if !status.is_success() {
             return Err(AppError::ExternalService(format!("Vault CouchDB answered {status} writing documents")));
         }
-        let body: Json = response.json().await.map_err(|e| AppError::ExternalService(format!("Bad CouchDB body: {e}")))?;
+        let body: Json = response.json().await.map_err(bad_body)?;
         let errors: Vec<String> = body
             .as_array()
             .into_iter()
@@ -367,8 +389,8 @@ impl Couch {
 
     /// Ids (and revs) of every document whose id starts with `prefix`.
     pub async fn ids_with_prefix(&self, prefix: &str) -> AppResult<Vec<String>> {
-        let start: String = url::form_urlencoded::byte_serialize(format!("\"{prefix}\"").as_bytes()).collect();
-        let end: String = url::form_urlencoded::byte_serialize(format!("\"{prefix}\u{fff0}\"").as_bytes()).collect();
+        let start = encode_component(&format!("\"{prefix}\""));
+        let end = encode_component(&format!("\"{prefix}\u{fff0}\""));
         let response = self
             .send(self.request(
                 reqwest::Method::GET,
@@ -379,7 +401,7 @@ impl Couch {
         if !status.is_success() {
             return Err(AppError::ExternalService(format!("Vault CouchDB answered {status} listing documents")));
         }
-        let body: Json = response.json().await.map_err(|e| AppError::ExternalService(format!("Bad CouchDB body: {e}")))?;
+        let body: Json = response.json().await.map_err(bad_body)?;
         Ok(body
             .get("rows")
             .and_then(Json::as_array)
@@ -396,7 +418,7 @@ impl Couch {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultStatus {
     pub configured: bool,
-    /// The CouchDB base URL (no credentials live in it).
+    /// The CouchDB base URL, with any credentials removed.
     pub url: Option<String>,
     pub database: Option<String>,
     /// The vault folder this app owns.
@@ -416,7 +438,7 @@ pub async fn status(state: &AppState) -> AppResult<VaultStatus> {
     let local_files = vault_tree(state).await?.len();
     let mut out = VaultStatus {
         configured: config.couchdb_url.is_some() && config.database.is_some(),
-        url: config.couchdb_url.clone(),
+        url: config.couchdb_url.as_deref().map(crate::config::strip_userinfo),
         database: config.database.clone(),
         folder: config.folder.clone(),
         local_files,
@@ -608,8 +630,6 @@ mod tests {
             axum::Json(json!(out))
         }
         async fn get_one(State(s): State<Store>, AxPath((_db, id)): AxPath<(String, String)>) -> axum::response::Response {
-            // `Couch` form-encodes ids, so a space arrives as `+`, as CouchDB reads it.
-            let id = id.replace('+', " ");
             match s.lock().unwrap().get(&id) {
                 Some(doc) => axum::Json(doc.clone()).into_response(),
                 None => (axum::http::StatusCode::NOT_FOUND, axum::Json(json!({ "error": "not_found" }))).into_response(),
@@ -821,6 +841,41 @@ mod tests {
         assert!(file.content.starts_with("---\nnova-note-id: note:"), "{}", file.content);
         assert!(file.content.ends_with("No notebook\n"), "{}", file.content);
         assert!(file.mtime > 0);
+    }
+
+    #[tokio::test]
+    async fn status_never_echoes_credentials_or_network_detail() {
+        let app = TestApp::new().await;
+        // A port nothing listens on.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mut state = app.state.clone();
+        let mut config = (*state.config).clone();
+        config.vault = VaultConfig {
+            couchdb_url: Some(format!("http://admin:s3cret-pass@127.0.0.1:{port}")),
+            database: Some("vault".into()),
+            folder: "NovaNotes".into(),
+            ..Default::default()
+        };
+        state.config = std::sync::Arc::new(config);
+
+        let status = status(&state).await.unwrap();
+        assert_eq!(status.url.as_deref(), Some(format!("http://127.0.0.1:{port}").as_str()));
+        assert_eq!(status.reachable, Some(false));
+        assert_eq!(status.error.as_deref(), Some("Could not reach the vault CouchDB."));
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(!json.contains("s3cret-pass") && !json.contains("admin"), "{json}");
+    }
+
+    #[test]
+    fn document_ids_are_strictly_percent_encoded() {
+        let couch = Couch::from_config(&VaultConfig {
+            couchdb_url: Some("http://127.0.0.1:5984".into()),
+            database: Some("vault".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(couch.doc_path("novanotes/my plan+v2.md"), "vault/novanotes%2Fmy%20plan%2Bv2.md");
+        assert_eq!(encode_component("\"a b\""), "%22a%20b%22");
     }
 
     #[tokio::test]

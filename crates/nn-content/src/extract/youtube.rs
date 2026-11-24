@@ -140,6 +140,11 @@ pub(crate) async fn extract_youtube(url: &str, ctx: &ExtractContext) -> Result<E
         .ok()
         .filter(|u| matches!(u.scheme(), "http" | "https"))
         .ok_or_else(|| blocked("the caption track URL is not valid"))?;
+    // The track URL comes from the player response and is fetched with the
+    // YouTube cookies, so it must stay on YouTube.
+    if !is_youtube_caption_host(&track_url, base) {
+        return Err(blocked("the caption track URL is not on youtube.com"));
+    }
     let response = client
         .get(track_url)
         .header(USER_AGENT, ctx.user_agent.as_str())
@@ -181,6 +186,18 @@ pub(crate) async fn extract_youtube(url: &str, ctx: &ExtractContext) -> Result<E
         file_path: None,
         metadata,
     })
+}
+
+/// `youtube.com`, a subdomain of it, or the host of the configured YouTube
+/// origin (`ExtractContext::youtube_base_url`).
+fn is_youtube_caption_host(url: &Url, base: &str) -> bool {
+    let Some(host) = url.host_str().map(|h| h.trim_end_matches('.').to_ascii_lowercase()) else {
+        return false;
+    };
+    if host == "youtube.com" || host.ends_with(".youtube.com") {
+        return true;
+    }
+    Url::parse(base).ok().and_then(|b| b.host_str().map(str::to_ascii_lowercase)).is_some_and(|b| b == host)
 }
 
 fn youtube_client(ctx: &ExtractContext) -> Result<reqwest::Client, ContentError> {
@@ -627,6 +644,39 @@ mod tests {
         let out = run(&hinted).await.unwrap();
         assert_eq!(out.content, "Nunca te voy a dejar.");
         assert_eq!(out.metadata["caption_kind"], "manual");
+    }
+
+    #[test]
+    fn caption_hosts_are_confined_to_youtube() {
+        let ok = |u: &str| is_youtube_caption_host(&Url::parse(u).unwrap(), "https://www.youtube.com");
+        assert!(ok("https://www.youtube.com/api/timedtext?v=x"));
+        assert!(ok("https://youtube.com/api/timedtext"));
+        assert!(ok("https://m.YouTube.com./api/timedtext"));
+        assert!(!ok("https://evilyoutube.com/api/timedtext"));
+        assert!(!ok("https://youtube.com.evil.example/api/timedtext"));
+        assert!(!ok("http://127.0.0.1:11434/api/tags"));
+        assert!(!ok("http://169.254.169.254/latest/meta-data/"));
+    }
+
+    #[tokio::test]
+    async fn caption_tracks_off_youtube_are_not_fetched() {
+        let server = MockServer::start().await;
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"<transcript><text start="0" dur="2">internal data</text></transcript>"#,
+            "text/xml",
+        )).mount(&elsewhere).await;
+        // Same port, other host name: `localhost` instead of the base's 127.0.0.1.
+        let foreign = format!("http://localhost:{}/api/timedtext?lang=en", elsewhere.address().port());
+        let tracks = json!([{"baseUrl": foreign, "languageCode": "en"}]);
+        Mock::given(method("GET"))
+            .and(path("/watch"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(watch_page(&player(&server, tracks), false), "text/html"))
+            .mount(&server)
+            .await;
+        let error = run(&youtube_ctx(&server).await).await.unwrap_err();
+        assert!(matches!(&error, ContentError::ExternalService(m) if m.contains("not on youtube.com")), "{error:?}");
+        assert!(elsewhere.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

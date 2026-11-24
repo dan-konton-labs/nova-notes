@@ -7,7 +7,7 @@
 //! PowerPoint: one `## Slide N: title` section per slide in presentation
 //! order, with text boxes, tables and speaker notes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{core_properties, parent_dir, resolve_part, DocOutput, Package};
 use crate::error::ContentError;
@@ -209,6 +209,9 @@ fn docx_table(table: &XmlNode, numbering: &Numbering) -> String {
 
 // --- PowerPoint -------------------------------------------------------------
 
+/// Most slides read from one presentation.
+const MAX_SLIDES: usize = 5_000;
+
 pub(super) fn extract_pptx(bytes: &[u8]) -> Result<DocOutput, ContentError> {
     let mut package = Package::open(bytes)?;
     let slide_parts = slide_order(&mut package)?;
@@ -277,15 +280,25 @@ fn slide_order(package: &mut Package) -> Result<Vec<String>, ContentError> {
     let mut ordered = Vec::new();
     if let Some(presentation) = package.read_xml_lenient("ppt/presentation.xml") {
         let rels = relationships(package, "ppt/presentation.xml");
+        let mut targets: HashMap<&str, &str> = HashMap::new();
+        for (id, _, target) in &rels {
+            targets.entry(id.as_str()).or_insert(target.as_str());
+        }
+        let present: HashSet<&str> = names.iter().map(String::as_str).collect();
+        let mut seen: HashSet<&str> = HashSet::new();
         if let Some(list) = presentation.find("p:sldIdLst") {
             for slide in list.elements().filter(|n| n.name == "p:sldId") {
-                let target = slide
-                    .attr("r:id")
-                    .and_then(|id| rels.iter().find(|(rel_id, _, _)| rel_id == id))
-                    .map(|(_, _, target)| target.clone());
-                if let Some(target) = target.filter(|t| names.contains(t)) {
-                    ordered.push(target);
+                // A slide listed twice is read once; a list longer than any
+                // real deck is cut short.
+                let Some(target) = slide.attr("r:id").and_then(|id| targets.get(id).copied()) else { continue };
+                if !present.contains(target) || !seen.insert(target) {
+                    continue;
                 }
+                if ordered.len() == MAX_SLIDES {
+                    tracing::warn!("presentation lists more than {MAX_SLIDES} slides; the rest are skipped");
+                    break;
+                }
+                ordered.push(target.to_string());
             }
         }
     }
@@ -298,7 +311,7 @@ fn slide_order(package: &mut Package) -> Result<Vec<String>, ContentError> {
             })
             .collect();
         numbered.sort();
-        ordered = numbered.into_iter().map(|(_, name)| name).collect();
+        ordered = numbered.into_iter().take(MAX_SLIDES).map(|(_, name)| name).collect();
     }
     Ok(ordered)
 }
@@ -599,6 +612,24 @@ pub(crate) mod tests {
              - Phase one\n  - Design review\n\n\
              | Q | Goal |\n| --- | --- |\n| 1 | Launch |"
         );
+    }
+
+    #[test]
+    fn repeated_slide_ids_are_read_once() {
+        let ids: String = (0..50_000).map(|i| format!(r#"<p:sldId id="{}" r:id="rId1"/>"#, 256 + i)).collect();
+        let presentation = format!(r#"<p:presentation {P_NS}><p:sldIdLst>{ids}</p:sldIdLst></p:presentation>"#);
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="slide" Target="slides/slide1.xml"/></Relationships>"#;
+        let big_slide = slide("Only", &format!(r#"<p:sp><p:txBody><a:p><a:r><a:t>{}</a:t></a:r></a:p></p:txBody></p:sp>"#, "word ".repeat(100_000)));
+        let bytes = zip_bytes(&[
+            ("ppt/presentation.xml", presentation.as_bytes()),
+            ("ppt/_rels/presentation.xml.rels", rels.as_bytes()),
+            ("ppt/slides/slide1.xml", big_slide.as_bytes()),
+        ]);
+        let started = std::time::Instant::now();
+        let out = extract_pptx(&bytes).unwrap();
+        assert_eq!(out.metadata["slides"], 1);
+        assert_eq!(out.content.matches("## Slide").count(), 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "took {:?}", started.elapsed());
     }
 
     #[test]

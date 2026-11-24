@@ -72,19 +72,26 @@ fn is_horizontal_rule(line: &str) -> bool {
 
 /// `(\*\*|__|\*|_|~~|`)(?=\S)(.+?)(?<=\S)\1` replaced by its content: remove
 /// emphasis, strikethrough and code delimiters that tightly wrap text.
+///
+/// Linear in the line length: the closing search for each delimiter only ever
+/// starts further right than the last one, so its last answer is reused while
+/// it is still ahead, and a search that found nothing settles every later one.
 fn strip_inline_markup(line: &str) -> String {
     const DELIMITERS: [&str; 6] = ["**", "__", "*", "_", "~~", "`"];
     let chars: Vec<char> = line.chars().collect();
+    let delimiters: [Vec<char>; 6] = DELIMITERS.map(|delimiter| delimiter.chars().collect());
     let starts_with = |at: usize, delimiter: &[char]| {
         chars.len() >= at + delimiter.len() && chars[at..at + delimiter.len()] == *delimiter
     };
+    // Per delimiter: `(from, close)` of its last search, where `close` is the
+    // first valid closing position at or after `from`, or `None` for none.
+    let mut searched: [Option<(usize, Option<usize>)>; 6] = [None; 6];
 
     let mut out = String::with_capacity(line.len());
     let mut position = 0;
     'scan: while position < chars.len() {
-        for delimiter in DELIMITERS {
-            let delimiter: Vec<char> = delimiter.chars().collect();
-            if !starts_with(position, &delimiter) {
+        for (which, delimiter) in delimiters.iter().enumerate() {
+            if !starts_with(position, delimiter) {
                 continue;
             }
             let start = position + delimiter.len();
@@ -93,8 +100,17 @@ fn strip_inline_markup(line: &str) -> String {
             }
             // Shortest content (at least one character, not ending in
             // whitespace) that is followed by the same delimiter.
-            let close = (start + 1..chars.len())
-                .find(|&end| !chars[end - 1].is_whitespace() && starts_with(end, &delimiter));
+            let from = start + 1;
+            let close = match searched[which] {
+                Some((earlier, None)) if earlier <= from => None,
+                Some((_, Some(end))) if end >= from => Some(end),
+                _ => {
+                    let found = (from..chars.len())
+                        .find(|&end| !chars[end - 1].is_whitespace() && starts_with(end, delimiter));
+                    searched[which] = Some((from, found));
+                    found
+                }
+            };
             if let Some(end) = close {
                 out.extend(&chars[start..end]);
                 position = end + delimiter.len();
@@ -389,6 +405,73 @@ mod tests {
         assert_eq!(strip_inline_markup("* a*b *"), "* a*b *");
         assert_eq!(strip_inline_markup("_ x _y_"), "_ x y");
         assert_eq!(strip_inline_markup("**a ** b**"), "a ** b");
+    }
+
+    /// Issue #34: unclosed delimiters used to rescan the rest of the line
+    /// each, so one long line of `*a ` took minutes.
+    #[test]
+    fn inline_markup_is_linear_in_the_line_length() {
+        let line = "*a ".repeat(MAX_SCRIPT_CHARS / 3);
+        let started = std::time::Instant::now();
+        assert_eq!(strip_inline_markup(&line), line);
+        let mixed = "_x ".repeat(MAX_SCRIPT_CHARS / 6) + &"**y ~~z `w ".repeat(MAX_SCRIPT_CHARS / 22);
+        assert!(strip_inline_markup(&mixed).len() < mixed.len());
+        let turns = parse_script(&line, &speakers()).unwrap();
+        assert!(!turns.is_empty());
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(10), "took {elapsed:?}");
+    }
+
+    /// The original quadratic matcher, kept to check the linear one against.
+    fn strip_inline_markup_reference(line: &str) -> String {
+        let chars: Vec<char> = line.chars().collect();
+        let starts_with = |at: usize, delimiter: &[char]| {
+            chars.len() >= at + delimiter.len() && chars[at..at + delimiter.len()] == *delimiter
+        };
+        let mut out = String::new();
+        let mut position = 0;
+        'scan: while position < chars.len() {
+            for delimiter in ["**", "__", "*", "_", "~~", "`"] {
+                let delimiter: Vec<char> = delimiter.chars().collect();
+                if !starts_with(position, &delimiter) {
+                    continue;
+                }
+                let start = position + delimiter.len();
+                if start >= chars.len() || chars[start].is_whitespace() {
+                    continue;
+                }
+                let close = (start + 1..chars.len())
+                    .find(|&end| !chars[end - 1].is_whitespace() && starts_with(end, &delimiter));
+                if let Some(end) = close {
+                    out.extend(&chars[start..end]);
+                    position = end + delimiter.len();
+                    continue 'scan;
+                }
+            }
+            out.push(chars[position]);
+            position += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn linear_inline_markup_matches_the_original_rules() {
+        let alphabet: Vec<char> = "*_~` ab".chars().collect();
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..20_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let len = (seed % 14) as usize;
+            let mut state = seed;
+            let line: String = (0..len)
+                .map(|_| {
+                    state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                    alphabet[(state >> 33) as usize % alphabet.len()]
+                })
+                .collect();
+            assert_eq!(strip_inline_markup(&line), strip_inline_markup_reference(&line), "{line:?}");
+        }
     }
 
     #[test]

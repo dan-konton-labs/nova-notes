@@ -562,6 +562,10 @@ mod tests {
         assert!((seconds - 2.0).abs() < 0.15, "{seconds}");
     }
 
+    /// Issue #31: an ID3 title that imitates ffmpeg's stream line must not
+    /// reach the filter graph. Before the fix the probe regex took the title
+    /// as the channel layout and the injected `ametadata=...:file=` filter
+    /// wrote `target`.
     #[tokio::test]
     async fn a_failing_ffmpeg_leaves_no_partial_file() {
         let dir = tempfile::tempdir().unwrap();

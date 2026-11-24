@@ -382,7 +382,7 @@ pub struct FileSupport {
 /// [`ContentError::EmptyContent`] rather than an empty success.
 pub async fn extract_content(input: ExtractInput, ctx: &ExtractContext) -> Result<Extracted, ContentError> {
     let extracted = match input {
-        ExtractInput::Text(text) => extract_text(text),
+        ExtractInput::Text(text) => extract_text(text).await?,
         ExtractInput::Url(url) => extract_url(&url, ctx).await?,
         ExtractInput::File { path, file_name, mime_type } => {
             let mut extracted = files::extract_file(&path, file_name.as_deref(), mime_type.as_deref(), ctx).await?;
@@ -425,22 +425,31 @@ pub async fn check_file_support(
     })
 }
 
-fn extract_text(text: String) -> Extracted {
+async fn extract_text(text: String) -> Result<Extracted, ContentError> {
     let trimmed = text.trim_start();
     let head: String = trimmed.chars().take(32).collect::<String>().to_ascii_lowercase();
     if head.starts_with("<!doctype html") || head.starts_with("<html") {
-        let page = html::html_to_markdown(&text, &html::HtmlOptions::default());
+        let (page, original) = files::run_blocking(move || {
+            let page = html::html_to_markdown(&text, &html::HtmlOptions::default());
+            Ok((page, text))
+        })
+        .await?;
         if !page.markdown.trim().is_empty() {
-            return Extracted {
+            return Ok(Extracted {
                 title: page.title,
                 content: page.markdown,
                 identified_type: "text".to_string(),
                 url: None,
                 file_path: None,
                 metadata: json!({ "mime_type": "text/html", "converted_from": "html" }),
-            };
+            });
         }
+        return Ok(plain_text(original));
     }
+    Ok(plain_text(text))
+}
+
+fn plain_text(text: String) -> Extracted {
     Extracted {
         title: None,
         content: text,

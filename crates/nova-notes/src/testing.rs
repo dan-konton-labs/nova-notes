@@ -29,7 +29,12 @@ pub struct TestApp {
 
 impl TestApp {
     pub async fn new() -> Self {
-        let (state, dir) = AppState::for_tests().await.expect("test state");
+        Self::with_config(|_| {}).await
+    }
+
+    /// A test app whose configuration `edit` adjusts before anything starts.
+    pub async fn with_config(edit: impl FnOnce(&mut crate::config::Config)) -> Self {
+        let (state, dir) = AppState::for_tests_with(edit).await.expect("test state");
         crate::services::start(&state).await.expect("services start");
         Self { router: crate::api::build_router(state.clone()), state, _dir: dir }
     }

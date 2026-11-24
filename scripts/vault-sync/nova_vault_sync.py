@@ -20,12 +20,16 @@ Safety model:
   * Re-check before writing (a changed revision aborts the run), a durable journal before the first write,
     read-back verification after, and a leftover journal blocks later runs until a person looks at it.
   * Note text and CLI diagnostics never appear in logs or error messages.
+  * Nova Notes is called with `Authorization: Bearer <OPEN_NOTEBOOK_PASSWORD>` when one is given (the
+    NOVA_NOTES_TOKEN environment variable or --token-file, a 0600 file); plain http:// is refused for
+    anything but a loopback address unless --allow-insecure-http.
 
 Standard library only. Needs Docker (the CLI runs as `novahq/livesync-cli`).
 """
 import argparse
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 import subprocess
@@ -35,7 +39,12 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+# A tag can be re-pushed. Pin the image you have checked by digest with --image (or edit this line), e.g.
+#   docker image inspect --format '{{index .RepoDigests 0}}' novahq/livesync-cli:1.0.40
+# gives `novahq/livesync-cli@sha256:...`; for an image only built locally use its ID
+# (`docker image inspect --format '{{.Id}}' ...`). See README.md, "Pinning the CLI image".
 DEFAULT_IMAGE = "novahq/livesync-cli:1.0.40"
+TOKEN_ENV = "NOVA_NOTES_TOKEN"
 DEFAULT_FOLDER = "NovaNotes"
 DEFAULT_NOVA = "http://127.0.0.1:5055"
 
@@ -60,6 +69,56 @@ def in_scope(folder, path):
 # ---------------------------------------------------------------------------
 # The writer directory and its settings
 # ---------------------------------------------------------------------------
+
+
+def private_mkdir(path, top):
+    """Create `path` and every missing level below `top` with mode 0700 (mkdir's mode only covers the leaf)."""
+    path, top = Path(path), Path(top)
+    missing = []
+    while path != top and not path.exists():
+        missing.append(path)
+        path = path.parent
+    for level in reversed(missing):
+        level.mkdir(mode=0o700)
+        os.chmod(level, 0o700)  # mkdir's mode is filtered by the umask
+
+
+def is_pinned(image):
+    """An image named by digest (`name@sha256:...`) or by image ID (`sha256:...`)."""
+    return "@sha256:" in image or image.startswith("sha256:")
+
+
+def load_token(token_file=None, environ=None):
+    """The Nova Notes password to send as a bearer token: --token-file (must be 0600) or NOVA_NOTES_TOKEN."""
+    environ = os.environ if environ is None else environ
+    if token_file:
+        path = Path(token_file)
+        if not path.is_file():
+            raise Refused("--token-file does not exist")
+        if path.stat().st_mode & 0o077:
+            raise Refused("--token-file must be mode 0600")
+        token = path.read_text().strip()
+    else:
+        token = (environ.get(TOKEN_ENV) or "").strip()
+    if any(ord(c) < 33 or ord(c) > 126 for c in token):
+        raise Refused("the Nova Notes token has spaces or characters a header cannot carry")
+    return token or None
+
+
+def check_nova_url(nova_url, allow_insecure_http=False):
+    """Plain http:// is fine to a loopback address; elsewhere notes (and the token) would cross the network in clear."""
+    parts = urlsplit(nova_url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise Refused("--nova-url must be an http:// or https:// URL")
+    if parts.scheme == "https" or allow_insecure_http:
+        return
+    host = parts.hostname
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host == "localhost"
+    if not loopback:
+        raise Refused("--nova-url is plain http:// to another machine; use https:// or pass --allow-insecure-http")
 
 
 def check_settings(writer, expect_db, allow_unencrypted=False):
@@ -197,8 +256,11 @@ def plan(tree, index, remote_sha, case_sensitive=False):
     return out
 
 
-def fetch_tree(nova_url, folder):
+def fetch_tree(nova_url, folder, token=None):
     request = urllib.request.Request(nova_url.rstrip("/") + "/api/vault/files?content=true", headers={"Accept": "application/json"})
+    if token:
+        # Unredirected: urllib would otherwise copy it onto a redirect to another host.
+        request.add_unredirected_header("Authorization", f"Bearer {token}")
     with urllib.request.urlopen(request, timeout=60) as response:
         body = json.load(response)
     if body.get("folder") != folder:
@@ -272,7 +334,7 @@ def run_once(writer, tree, vault, state, dry_run=False, case_sensitive=False, sl
     for path, _data, rev in result["overwrite"]:
         old = vault.cat(path)
         target = writer / "overwritten" / stamp / path
-        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        private_mkdir(target.parent, writer)
         fd = os.open(target, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
         with os.fdopen(fd, "wb") as handle:
             handle.write(old)
@@ -308,25 +370,33 @@ def main(argv=None):
     parser.add_argument("--writer", required=True, help="directory with the CLI's settings.json (0600); state and journal live here")
     parser.add_argument("--expect-db", required=True, help="the one CouchDB database this writer may talk to")
     parser.add_argument("--nova-url", default=DEFAULT_NOVA)
+    parser.add_argument("--token-file", help=f"file (mode 0600) holding Nova Notes' OPEN_NOTEBOOK_PASSWORD; or set {TOKEN_ENV}")
+    parser.add_argument("--allow-insecure-http", action="store_true", help="allow a plain http:// --nova-url that is not loopback")
     parser.add_argument("--folder", default=DEFAULT_FOLDER, help="vault folder Nova Notes writes under (VAULT_FOLDER)")
-    parser.add_argument("--image", default=DEFAULT_IMAGE)
-    parser.add_argument("--network", default="host", help="docker network for the CLI container")
+    parser.add_argument("--image", default=DEFAULT_IMAGE, help="the LiveSync CLI image; pin it by digest (name@sha256:...)")
+    parser.add_argument("--network", default="host",
+                        help="docker network for the CLI container. host (the default) lets it reach a CouchDB that "
+                             "listens only on the host's loopback; use bridge when CouchDB has a routable address")
     parser.add_argument("--dry-run", action="store_true", help="report what would change, write nothing")
     parser.add_argument("--allow-unencrypted", action="store_true", help="throwaway tests only")
     parser.add_argument("--case-sensitive", action="store_true", help="the vault has 'Handle files as case-sensitive' on")
     args = parser.parse_args(argv)
 
     writer = Path(args.writer)
+    if not is_pinned(args.image):
+        print(f"warning: {args.image} is a mutable tag; pin the image by digest with --image (see README.md)", file=sys.stderr)
     try:
+        check_nova_url(args.nova_url, args.allow_insecure_http)
+        token = load_token(args.token_file)
         remote_id = check_settings(writer, args.expect_db, args.allow_unencrypted)
-        (writer / "db").mkdir(exist_ok=True)
-        lock = open(writer / "lock", "w")
+        private_mkdir(writer / "db", writer)
+        lock = os.fdopen(os.open(writer / "lock", os.O_CREAT | os.O_WRONLY, 0o600), "w")
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             raise Refused("another run is in progress")
         vault = Vault(Cli(writer, args.image, args.network), args.folder, args.expect_db, remote_id)
-        tree = fetch_tree(args.nova_url, args.folder)
+        tree = fetch_tree(args.nova_url, args.folder, token)
         report = run_once(writer, tree, vault, State(writer), args.dry_run, args.case_sensitive)
     except Refused as error:
         print(json.dumps({"refused": str(error)}))

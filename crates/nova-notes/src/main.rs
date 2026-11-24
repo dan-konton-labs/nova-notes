@@ -29,7 +29,13 @@ directory is loaded if present). The main variables:
                                    Unset: use the embedded database in DATA_FOLDER.
     SURREAL_USER, SURREAL_PASSWORD, SURREAL_NAMESPACE, SURREAL_DATABASE
     OPEN_NOTEBOOK_ENCRYPTION_KEY   Passphrase protecting stored API keys
-    OPEN_NOTEBOOK_PASSWORD         Password for the app (unset: no login)
+    OPEN_NOTEBOOK_PASSWORD         Password for the app (unset: no login; then the
+                                   server only starts on a loopback API_HOST)
+    OPEN_NOTEBOOK_ALLOWED_HOSTS    Extra host names to answer to, comma-separated
+                                   (e.g. notes.tailnet-name.ts.net or .tailnet-name.ts.net)
+    OPEN_NOTEBOOK_ALLOW_UNAUTHENTICATED
+                                   true: allow no password on a non-loopback API_HOST
+    CORS_ORIGINS                   Other sites allowed to call the API (default: none)
 ";
 
 fn main() -> anyhow::Result<()> {
@@ -74,6 +80,11 @@ fn main() -> anyhow::Result<()> {
 
 async fn run(command: &str) -> anyhow::Result<()> {
     let config = Config::from_env();
+    if command == "serve" {
+        // Checked before touching the database, so a misconfigured container
+        // stops at once with the reason instead of serving an open app.
+        config.check_listen_safety().map_err(|message| anyhow::anyhow!(message))?;
+    }
     tracing::info!("Nova Notes {} starting; database: {}", nova_notes::VERSION, describe_database(&config));
 
     // AppState::init waits for nothing: retry here so a database container
@@ -93,9 +104,17 @@ async fn run(command: &str) -> anyhow::Result<()> {
             "OPEN_NOTEBOOK_ENCRYPTION_KEY is not set. Saving AI provider API keys will fail until it is. Set it to any secret string."
         );
     }
-    if state.config.cors_is_default {
-        tracing::warn!("CORS_ORIGINS is not set: the API accepts cross-origin requests from any origin.");
+    if state.config.cors_origins.iter().any(|o| o == "*") && state.config.password.is_none() {
+        tracing::warn!("CORS_ORIGINS=* is ignored because OPEN_NOTEBOOK_PASSWORD is not set: no other site may call the API.");
     }
+    if state.config.allow_unauthenticated && state.config.password.is_none() {
+        tracing::warn!("OPEN_NOTEBOOK_ALLOW_UNAUTHENTICATED is set: serving without a password on {}.", state.config.host);
+    }
+    tracing::info!(
+        "Answering to localhost, 127.0.0.1 and [::1]{}. Other host names (a Tailscale name, a LAN name) need \
+         OPEN_NOTEBOOK_ALLOWED_HOSTS or OPEN_NOTEBOOK_PUBLIC_URL.",
+        if state.config.allowed_hosts.is_empty() { String::new() } else { format!(", plus {}", state.config.allowed_hosts.join(", ")) }
+    );
     match &state.config.searxng_url {
         Some(url) => tracing::info!("Discover searches SearXNG at {url} first, then the public engines."),
         None => tracing::info!(
@@ -104,6 +123,13 @@ async fn run(command: &str) -> anyhow::Result<()> {
     }
     if state.config.password.is_none() {
         tracing::warn!("OPEN_NOTEBOOK_PASSWORD is not set: anyone who can reach this server can use it.");
+    }
+    if remote_database_uses_default_password(&state.config) {
+        tracing::warn!(
+            "SURREAL_PASSWORD is not set: signing in to the remote database {} with the default password \"root\". \
+             Set SURREAL_PASSWORD (and SURREAL_USER) to the database's real credentials.",
+            state.config.surreal_url.as_deref().unwrap_or_default()
+        );
     }
 
     services::start(&state).await?;
@@ -114,7 +140,7 @@ async fn run(command: &str) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     tracing::info!("Listening on http://{}", listener.local_addr()?);
 
-    axum::serve(listener, api::build_router(state))
+    axum::serve(listener, api::build_router(state).into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
             tracing::info!("Shutting down");
@@ -152,6 +178,19 @@ async fn import_chat_history(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A remote database (ws/wss/http/https) with neither `SURREAL_PASSWORD` nor
+/// `SURREAL_PASS` set is signed in to with the fallback password "root".
+fn remote_database_uses_default_password(config: &Config) -> bool {
+    password_is_defaulted(config.surreal_url.as_deref(), |name| std::env::var(name).ok())
+}
+
+fn password_is_defaulted(surreal_url: Option<&str>, env: impl Fn(&str) -> Option<String>) -> bool {
+    let remote = surreal_url
+        .is_some_and(|url| ["ws://", "wss://", "http://", "https://"].iter().any(|p| url.starts_with(p)));
+    let set = |name: &str| env(name).is_some_and(|v| !v.trim().is_empty());
+    remote && !set("SURREAL_PASSWORD") && !set("SURREAL_PASS")
+}
+
 fn describe_database(config: &Config) -> String {
     match &config.surreal_url {
         Some(url) => format!("{url} (namespace {}, database {})", config.surreal_namespace, config.surreal_database),
@@ -175,4 +214,20 @@ async fn connect_with_retry(config: Config) -> anyhow::Result<AppState> {
         }
     }
     unreachable!("the last attempt always returns")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::password_is_defaulted;
+
+    #[test]
+    fn a_remote_database_without_a_password_is_flagged() {
+        let none = |_: &str| None;
+        let pass = |name: &str| (name == "SURREAL_PASS").then(|| "s3cret".to_string());
+        assert!(password_is_defaulted(Some("ws://db:8000/rpc"), none));
+        assert!(password_is_defaulted(Some("https://db.example"), |_: &str| Some("  ".to_string())));
+        assert!(!password_is_defaulted(Some("ws://db:8000/rpc"), pass));
+        assert!(!password_is_defaulted(Some("surrealkv://./data/db"), none));
+        assert!(!password_is_defaulted(None, none));
+    }
 }

@@ -7,28 +7,75 @@
 
 use std::io::Cursor;
 
-use calamine::{Data, Ods, Range, Reader, Xls, Xlsb, Xlsx};
+use calamine::{Data, Ods, Reader, Xls, Xlsb, Xlsx};
 
-use super::{decode_text, DocOutput};
+use super::{check_zip_budget, decode_text, DocOutput};
 use crate::error::ContentError;
 use crate::extract::detect::FileKind;
 use crate::extract::markdown;
 
+/// Most non-empty cells read from one workbook, all sheets together. Further
+/// cells are left out and the output says so.
+const MAX_WORKBOOK_CELLS: usize = 2_000_000;
+/// Largest table rendered for one sheet, in rows x columns that hold data.
+const MAX_SHEET_GRID: usize = 5_000_000;
+
 pub(super) fn extract_workbook(kind: &FileKind, bytes: &[u8]) -> Result<DocOutput, ContentError> {
-    let cursor = Cursor::new(bytes);
     let unreadable = |e: String| ContentError::FileOperation(format!("cannot read the workbook: {e}"));
+    if matches!(kind, FileKind::Xlsx | FileKind::Xlsb | FileKind::Ods) {
+        check_zip_budget(bytes)?;
+    }
+    if matches!(kind, FileKind::Ods) {
+        ods::check_size(bytes)?;
+    }
+    let cursor = Cursor::new(bytes);
+    let mut budget = CellBudget { remaining: MAX_WORKBOOK_CELLS, truncated: false };
+    // Sheets are read cell by cell where the format allows it: calamine's
+    // `worksheets()` expands each sheet to a dense grid over the bounding box
+    // of its cells, so two cells in opposite corners would cost 17 billion.
     let sheets = match kind {
-        FileKind::Xlsx => read_sheets(Xlsx::new(cursor).map_err(|e| unreadable(e.to_string()))?),
-        FileKind::Xlsb => read_sheets(Xlsb::new(cursor).map_err(|e| unreadable(e.to_string()))?),
-        FileKind::Xls => read_sheets(Xls::new(cursor).map_err(|e| unreadable(e.to_string()))?),
-        _ => read_sheets(Ods::new(cursor).map_err(|e| unreadable(e.to_string()))?),
+        FileKind::Xlsx => {
+            let mut book = Xlsx::new(cursor).map_err(|e| unreadable(e.to_string()))?;
+            let mut sheets = Vec::new();
+            for name in book.sheet_names() {
+                let Ok(mut reader) = book.worksheet_cells_reader(&name) else { continue };
+                let mut cells = Vec::new();
+                while let Some(cell) = reader.next_cell().map_err(|e| unreadable(e.to_string()))? {
+                    if !push_cell(&mut cells, cell.get_position(), &cell.get_value().clone().into(), &mut budget) {
+                        break;
+                    }
+                }
+                sheets.push((name, cells));
+            }
+            sheets
+        }
+        FileKind::Xlsb => {
+            let mut book = Xlsb::new(cursor).map_err(|e| unreadable(e.to_string()))?;
+            let mut sheets = Vec::new();
+            for name in book.sheet_names() {
+                let Ok(mut reader) = book.worksheet_cells_reader(&name) else { continue };
+                let mut cells = Vec::new();
+                while let Some(cell) = reader.next_cell().map_err(|e| unreadable(e.to_string()))? {
+                    if !push_cell(&mut cells, cell.get_position(), &cell.get_value().clone().into(), &mut budget) {
+                        break;
+                    }
+                }
+                sheets.push((name, cells));
+            }
+            sheets
+        }
+        // The format caps these sheets (XLS at 65,536 x 256 cells, ODS by the
+        // size check above); only their used cells are kept.
+        FileKind::Xls => dense_sheets(Xls::new(cursor).map_err(|e| unreadable(e.to_string()))?, &mut budget),
+        _ => dense_sheets(Ods::new(cursor).map_err(|e| unreadable(e.to_string()))?, &mut budget),
     };
 
     let mut sections = Vec::new();
     let mut total_rows = 0usize;
     let sheet_count = sheets.len();
-    for (name, range) in sheets {
-        let rows = range_rows(&range);
+    for (name, cells) in sheets {
+        let (rows, cut) = sparse_rows(cells);
+        budget.truncated |= cut;
         if rows.is_empty() {
             continue;
         }
@@ -39,44 +86,208 @@ pub(super) fn extract_workbook(kind: &FileKind, bytes: &[u8]) -> Result<DocOutpu
     let mut out = DocOutput { content: sections.join("\n\n"), ..DocOutput::default() };
     out.set("sheets", sheet_count);
     out.set("rows", total_rows);
+    if budget.truncated {
+        tracing::warn!("workbook is larger than the import limits; part of it was left out");
+        out.set("truncated", true);
+    }
     Ok(out)
 }
 
-fn read_sheets<'a, R>(mut workbook: R) -> Vec<(String, Range<Data>)>
+/// Cells left to read from the workbook.
+struct CellBudget {
+    remaining: usize,
+    truncated: bool,
+}
+
+impl CellBudget {
+    /// Whether another cell may be read; records that the workbook was cut short.
+    fn take(&mut self) -> bool {
+        if self.remaining == 0 {
+            self.truncated = true;
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+}
+
+/// A non-empty cell: `(row, column, text)`.
+type SparseCell = (u32, u32, String);
+
+/// Keep `value` if it shows anything. False when the budget is spent and
+/// reading must stop.
+fn push_cell(cells: &mut Vec<SparseCell>, (row, column): (u32, u32), value: &Data, budget: &mut CellBudget) -> bool {
+    let text = cell_text(value);
+    if text.is_empty() {
+        return true;
+    }
+    if !budget.take() {
+        return false;
+    }
+    cells.push((row, column, text));
+    true
+}
+
+/// Used cells of every sheet of a workbook whose reader only offers whole ranges.
+fn dense_sheets<'a, R>(mut workbook: R, budget: &mut CellBudget) -> Vec<(String, Vec<SparseCell>)>
 where
     R: Reader<Cursor<&'a [u8]>>,
 {
-    workbook.worksheets()
+    let mut sheets = Vec::new();
+    for name in workbook.sheet_names() {
+        let Ok(range) = workbook.worksheet_range(&name) else { continue };
+        let mut cells = Vec::new();
+        let (start_row, start_column) = range.start().unwrap_or((0, 0));
+        for (row, column, value) in range.used_cells() {
+            let position = (start_row.saturating_add(row as u32), start_column.saturating_add(column as u32));
+            if !push_cell(&mut cells, position, value, budget) {
+                break;
+            }
+        }
+        sheets.push((name, cells));
+    }
+    sheets
 }
 
-/// Non-empty rows of a sheet as display strings, trailing empty cells removed.
-fn range_rows(range: &Range<Data>) -> Vec<Vec<String>> {
-    let mut rows: Vec<Vec<String>> = range
-        .rows()
-        .map(|row| {
-            let mut cells: Vec<String> = row.iter().map(cell_text).collect();
-            while cells.last().is_some_and(|c| c.is_empty()) {
-                cells.pop();
+/// Rows of a sheet as display strings: rows without data are left out,
+/// columns without data in any row are left out, trailing empty cells are
+/// trimmed. Built from the used cells only, never from the bounding box.
+/// The second value is true when the table had to be cut to [`MAX_SHEET_GRID`].
+fn sparse_rows(mut cells: Vec<SparseCell>) -> (Vec<Vec<String>>, bool) {
+    // Stable sort: of two cells at one position, the later one wins.
+    cells.sort_by_key(|(row, column, _)| (*row, *column));
+    let mut columns: Vec<u32> = cells.iter().map(|(_, column, _)| *column).collect();
+    columns.sort_unstable();
+    columns.dedup();
+    let width = columns.len().max(1);
+
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut current_row = None;
+    let mut cut = false;
+    for (row, column, text) in cells {
+        if current_row != Some(row) {
+            if (rows.len() + 1).saturating_mul(width) > MAX_SHEET_GRID {
+                cut = true;
+                break;
             }
-            cells
-        })
-        .filter(|cells| !cells.is_empty())
-        .collect();
-    // Drop columns that are empty in every row.
-    let width = rows.iter().map(Vec::len).max().unwrap_or(0);
-    let used: Vec<bool> =
-        (0..width).map(|column| rows.iter().any(|row| row.get(column).is_some_and(|c| !c.is_empty()))).collect();
-    if used.iter().any(|u| !u) {
-        for row in &mut rows {
-            let mut column = 0;
-            row.retain(|_| {
-                let keep = used.get(column).copied().unwrap_or(true);
-                column += 1;
-                keep
-            });
+            current_row = Some(row);
+            rows.push(Vec::new());
         }
+        let Some(line) = rows.last_mut() else { break };
+        let index = columns.binary_search(&column).unwrap_or_default();
+        if line.len() <= index {
+            line.resize(index + 1, String::new());
+        }
+        line[index] = text;
     }
-    rows
+    (rows, cut)
+}
+
+/// Size check for OpenDocument spreadsheets, which calamine expands in full
+/// (repeated rows and columns included) as soon as the file is opened.
+mod ods {
+    use std::io::{BufReader, Cursor, Read};
+
+    use quick_xml::events::{BytesStart, Event};
+    use quick_xml::Reader;
+
+    use super::MAX_SHEET_GRID;
+    use crate::error::ContentError;
+    use crate::extract::documents::MAX_DOCUMENT_BYTES;
+
+    const MAX_ROWS: usize = 1_048_576;
+    const MAX_COLUMNS: usize = 16_384;
+
+    fn repeats(element: &BytesStart, name: &str, cap: usize) -> usize {
+        element
+            .try_get_attribute(name)
+            .ok()
+            .flatten()
+            .and_then(|attr| attr.value.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, cap.max(1))
+    }
+
+    fn has_value(element: &BytesStart) -> bool {
+        ["office:value-type", "table:formula"].iter().any(|name| element.try_get_attribute(name).ok().flatten().is_some())
+    }
+
+    /// Reject the workbook when calamine would materialise more than
+    /// [`MAX_SHEET_GRID`] cells: the cells it stores while reading rows, or
+    /// the grid it then builds from the first to the last cell with data.
+    /// Errs on the side of counting a cell as holding data.
+    pub(super) fn check_size(bytes: &[u8]) -> Result<(), ContentError> {
+        let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(bytes)) else { return Ok(()) };
+        let Ok(content) = archive.by_name("content.xml") else { return Ok(()) };
+        let mut reader = Reader::from_reader(BufReader::new(content.take(MAX_DOCUMENT_BYTES)));
+        let too_large = || {
+            ContentError::FileOperation(format!("the spreadsheet has more than {MAX_SHEET_GRID} cells to import"))
+        };
+
+        let mut buf = Vec::new();
+        let (mut stored, mut grid) = (0usize, 0usize);
+        // Per sheet: next row index, first and last row with data, column span.
+        let mut row_index = 0usize;
+        let mut rows: Option<(usize, usize)> = None;
+        let mut columns: Option<(usize, usize)> = None;
+        // Per row: repeat count, next column, first column with data, end of the last one.
+        let mut row: Option<(usize, usize, Option<usize>, usize)> = None;
+        loop {
+            let event = match reader.read_event_into(&mut buf) {
+                Ok(event) => event,
+                // Broken XML: calamine reports it.
+                Err(_) => return Ok(()),
+            };
+            match event {
+                Event::Eof => break,
+                Event::Start(e) | Event::Empty(e) if e.name().as_ref() == "table:table" => {
+                    row_index = 0;
+                    rows = None;
+                    columns = None;
+                }
+                Event::Start(e) if e.name().as_ref() == "table:table-row" => {
+                    let repeat = repeats(&e, "table:number-rows-repeated", MAX_ROWS.saturating_sub(row_index));
+                    row = Some((repeat, 0, None, 0));
+                }
+                Event::Empty(e) if e.name().as_ref() == "table:table-row" => {
+                    row_index += repeats(&e, "table:number-rows-repeated", MAX_ROWS.saturating_sub(row_index));
+                }
+                ref event @ (Event::Start(ref e) | Event::Empty(ref e))
+                    if matches!(e.name().as_ref(), "table:table-cell" | "table:covered-table-cell") =>
+                {
+                    let Some((_, column, first, end)) = row.as_mut() else { continue };
+                    let repeat = repeats(e, "table:number-columns-repeated", MAX_COLUMNS.saturating_sub(*column));
+                    if matches!(event, Event::Start(_)) || has_value(e) {
+                        first.get_or_insert(*column);
+                        *end = *column + repeat;
+                    }
+                    *column = (*column + repeat).min(MAX_COLUMNS);
+                }
+                Event::End(e) if e.name().as_ref() == "table:table-row" => {
+                    let Some((repeat, _, first, end)) = row.take() else { continue };
+                    if let Some(first) = first {
+                        stored = stored.saturating_add(end);
+                        let (top, _) = rows.unwrap_or((row_index, 0));
+                        rows = Some((top, row_index + repeat - 1));
+                        let (left, right) = columns.unwrap_or((first, end));
+                        columns = Some((left.min(first), right.max(end)));
+                    }
+                    row_index = (row_index + repeat).min(MAX_ROWS);
+                }
+                Event::End(e) if e.name().as_ref() == "table:table" => {
+                    if let (Some((top, bottom)), Some((left, right))) = (rows, columns) {
+                        grid = grid.saturating_add((bottom - top + 1).saturating_mul(right - left));
+                    }
+                }
+                _ => {}
+            }
+            if stored > MAX_SHEET_GRID || grid > MAX_SHEET_GRID {
+                return Err(too_large());
+            }
+            buf.clear();
+        }
+        Ok(())
+    }
 }
 
 fn cell_text(cell: &Data) -> String {
@@ -190,6 +401,101 @@ pub(crate) mod tests {
         assert_eq!(out.metadata["sheets"], 2);
         assert_eq!(out.metadata["rows"], 3);
         assert_eq!(out.title, None);
+    }
+
+    /// A one-sheet workbook whose cells are `(reference, text)` inline strings.
+    fn xlsx_with_cells(cells: &[(String, String)]) -> Vec<u8> {
+        let workbook = r#"<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#;
+        let root_rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#;
+        let mut sheet = String::from(r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:XFD1048576"/><sheetData>"#);
+        for (reference, text) in cells {
+            sheet.push_str(&format!(r#"<c r="{reference}" t="inlineStr"><is><t>{text}</t></is></c>"#));
+        }
+        sheet.push_str("</sheetData></worksheet>");
+        zip_bytes(&[
+            ("_rels/.rels", root_rels.as_bytes()),
+            ("xl/workbook.xml", workbook.as_bytes()),
+            ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+            ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+        ])
+    }
+
+    fn column_name(mut index: usize) -> String {
+        let mut name = Vec::new();
+        loop {
+            name.push(b'A' + (index % 26) as u8);
+            if index < 26 {
+                break;
+            }
+            index = index / 26 - 1;
+        }
+        name.reverse();
+        String::from_utf8(name).unwrap()
+    }
+
+    #[test]
+    fn sparse_workbook_is_read_from_its_used_cells() {
+        // Two cells in opposite corners: a dense grid would be 16,384 x
+        // 1,048,576 cells (about 550 GB of `Data`).
+        let bytes = xlsx_with_cells(&[("A1".into(), "corner".into()), ("XFD1048576".into(), "far".into())]);
+        let started = std::time::Instant::now();
+        let out = extract_workbook(&FileKind::Xlsx, &bytes).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(out.content, "## Data\n\n| corner |  |\n| --- | --- |\n|  | far |");
+        assert_eq!(out.metadata["rows"], 2);
+        assert!(out.metadata.get("truncated").is_none());
+    }
+
+    #[test]
+    fn diagonal_workbook_is_cut_to_the_table_limit() {
+        // Every row and every column used once: a 3,000 x 3,000 table.
+        let cells: Vec<(String, String)> = (0..3000).map(|i| (format!("{}{}", column_name(i), i + 1), format!("v{i}"))).collect();
+        let out = extract_workbook(&FileKind::Xlsx, &xlsx_with_cells(&cells)).unwrap();
+        assert_eq!(out.metadata["truncated"], true);
+        let rows = out.metadata["rows"].as_u64().unwrap() as usize;
+        assert!(rows > 0 && rows * 3000 <= MAX_SHEET_GRID, "{rows}");
+        assert_eq!(column_name(0), "A");
+        assert_eq!(column_name(26), "AA");
+        assert_eq!(column_name(16383), "XFD");
+    }
+
+    fn ods_with_table(rows: &str) -> Vec<u8> {
+        let content = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" office:version="1.2"><office:body><office:spreadsheet><table:table table:name="Sheet1">{rows}</table:table></office:spreadsheet></office:body></office:document-content>"#
+        );
+        let manifest = r#"<?xml version="1.0" encoding="UTF-8"?><manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2"><manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.spreadsheet"/><manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/></manifest:manifest>"#;
+        zip_bytes(&[
+            ("mimetype", b"application/vnd.oasis.opendocument.spreadsheet"),
+            ("META-INF/manifest.xml", manifest.as_bytes()),
+            ("content.xml", content.as_bytes()),
+        ])
+    }
+
+    #[test]
+    fn ods_is_read_and_a_repeated_grid_is_refused() {
+        let small = ods_with_table(
+            r#"<table:table-row><table:table-cell office:value-type="string"><text:p>Name</text:p></table:table-cell><table:table-cell table:number-columns-repeated="3"/><table:table-cell office:value-type="float" office:value="7"><text:p>7</text:p></table:table-cell></table:table-row>
+<table:table-row table:number-rows-repeated="1048575"><table:table-cell table:number-columns-repeated="1024"/></table:table-row>"#,
+        );
+        let out = extract_workbook(&FileKind::Ods, &small).unwrap();
+        assert_eq!(out.content, "## Sheet1\n\n| Name | 7 |\n| --- | --- |");
+
+        // A few hundred bytes that calamine would expand to 16,384 x 6,000
+        // cells (about 5 GB with its parallel formula grid), just under its
+        // own 100-million-cell cap.
+        let huge = ods_with_table(
+            r#"<table:table-row table:number-rows-repeated="6000"><table:table-cell office:value-type="float" office:value="1"><text:p>1</text:p></table:table-cell><table:table-cell table:number-columns-repeated="16382"/><table:table-cell office:value-type="float" office:value="1"><text:p>1</text:p></table:table-cell></table:table-row>"#,
+        );
+        let started = std::time::Instant::now();
+        let error = extract_workbook(&FileKind::Ods, &huge).unwrap_err();
+        assert!(matches!(error, ContentError::FileOperation(ref m) if m.contains("cells")), "{error:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+        // Many stored rows, each wide: refused on what calamine stores while reading.
+        let row = r#"<table:table-row><table:table-cell table:number-columns-repeated="16383"/><table:table-cell office:value-type="float" office:value="1"><text:p>1</text:p></table:table-cell></table:table-row>"#;
+        let error = extract_workbook(&FileKind::Ods, &ods_with_table(&row.repeat(400))).unwrap_err();
+        assert!(matches!(error, ContentError::FileOperation(_)), "{error:?}");
     }
 
     #[test]

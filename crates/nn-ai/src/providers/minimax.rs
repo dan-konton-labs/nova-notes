@@ -84,7 +84,7 @@ impl TextToSpeechModel for MiniMaxSpeech {
             "voice_setting": {"voice_id": voice, "speed": 1, "vol": 1, "pitch": 0},
             "audio_setting": {"sample_rate": 32000, "bitrate": 128000, "format": "mp3", "channel": 1},
         });
-        let json = self.http.json(self.post("t2a_v2", &body)).await?;
+        let json = self.http.json_capped(self.post("t2a_v2", &body), crate::http::MAX_AUDIO_RESPONSE_BYTES).await?;
         self.check(&json)?;
         let audio = json
             .pointer("/data/audio")

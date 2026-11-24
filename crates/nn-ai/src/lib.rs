@@ -68,7 +68,7 @@ pub use factory::{
     speech_to_text_model_with_client, text_to_speech_model, text_to_speech_model_with_client, Clients,
 };
 pub use providers::anthropic::normalize_anthropic_compatible_base_url;
-pub use registry::{normalize_provider_name, provider, providers, EnvConfig, Modality, ProviderInfo, ProviderSpec, PROVIDERS};
+pub use registry::{base_url_rule, normalize_provider_name, provider, BaseUrlRule, providers, EnvConfig, Modality, ProviderInfo, ProviderSpec, PROVIDERS};
 pub use tester::{
     default_test_voice, test_model, test_model_with_client, test_provider_connection,
     test_provider_connection_with_client, ConnectionTestResult,

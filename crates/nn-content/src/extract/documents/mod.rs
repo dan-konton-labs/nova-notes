@@ -17,7 +17,10 @@ use super::xml::{self, XmlNode};
 use crate::error::ContentError;
 
 /// Largest decompressed size accepted for one part of a ZIP-based document.
-const MAX_PART_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_PART_BYTES: u64 = 64 * 1024 * 1024;
+/// Largest decompressed size read from one ZIP-based document, all parts
+/// together. A part read twice counts twice.
+pub(crate) const MAX_DOCUMENT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Result of parsing one document.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -101,13 +104,20 @@ pub(crate) fn decode_with_charset(bytes: &[u8], charset: Option<&str>) -> String
 /// A ZIP-based document package (OOXML, OpenDocument, EPUB).
 struct Package<'a> {
     archive: zip::ZipArchive<Cursor<&'a [u8]>>,
+    /// Decompressed bytes this document may still read ([`MAX_DOCUMENT_BYTES`] in all).
+    remaining: u64,
 }
 
 impl<'a> Package<'a> {
     fn open(bytes: &'a [u8]) -> Result<Self, ContentError> {
         zip::ZipArchive::new(Cursor::new(bytes))
-            .map(|archive| Self { archive })
+            .map(|archive| Self { archive, remaining: MAX_DOCUMENT_BYTES })
             .map_err(|e| ContentError::FileOperation(format!("not a readable ZIP container: {e}")))
+    }
+
+    #[cfg(test)]
+    fn with_budget(bytes: &'a [u8], budget: u64) -> Result<Self, ContentError> {
+        Self::open(bytes).map(|package| Self { remaining: budget, ..package })
     }
 
     fn names(&self) -> Vec<String> {
@@ -123,14 +133,28 @@ impl<'a> Package<'a> {
             .archive
             .by_index(index)
             .map_err(|e| ContentError::FileOperation(format!("cannot read '{name}' from the document: {e}")))?;
+        let limit = MAX_PART_BYTES.min(self.remaining);
+        let too_large = || {
+            ContentError::FileOperation(if limit < MAX_PART_BYTES {
+                format!("the document expands to more than {} MiB", MAX_DOCUMENT_BYTES >> 20)
+            } else {
+                format!("'{name}' in the document is too large")
+            })
+        };
+        // The declared size is checked first (the reader enforces it too),
+        // and the read is capped in case it lies.
+        if entry.size() > limit {
+            return Err(too_large());
+        }
         let mut data = Vec::new();
         entry
-            .take(MAX_PART_BYTES + 1)
+            .take(limit + 1)
             .read_to_end(&mut data)
             .map_err(|e| ContentError::FileOperation(format!("cannot read '{name}' from the document: {e}")))?;
-        if data.len() as u64 > MAX_PART_BYTES {
-            return Err(ContentError::FileOperation(format!("'{name}' in the document is too large")));
+        if data.len() as u64 > limit {
+            return Err(too_large());
         }
+        self.remaining -= data.len() as u64;
         Ok(Some(data))
     }
 
@@ -154,6 +178,34 @@ impl<'a> Package<'a> {
     fn read_xml_lenient(&mut self, name: &str) -> Option<XmlNode> {
         self.read_xml(name).ok().flatten()
     }
+}
+
+/// Check a ZIP-based workbook before a third-party parser opens it: the
+/// declared decompressed size of its XML and binary parts (not pictures)
+/// must fit the per-document budget. The ZIP reader refuses to inflate an
+/// entry past its declared size, so this bounds what the parser can read.
+pub(crate) fn check_zip_budget(bytes: &[u8]) -> Result<(), ContentError> {
+    check_zip_budget_within(bytes, MAX_DOCUMENT_BYTES)
+}
+
+fn check_zip_budget_within(bytes: &[u8], budget: u64) -> Result<(), ContentError> {
+    let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(bytes)) else {
+        // Not a ZIP: the parser reports it.
+        return Ok(());
+    };
+    let mut total: u64 = 0;
+    for index in 0..archive.len() {
+        let Ok(entry) = archive.by_index_raw(index) else { continue };
+        let Ok(name) = entry.name().map(|name| name.to_ascii_lowercase()) else { continue };
+        let parsed = [".xml", ".bin", ".rels"].iter().any(|ext| name.ends_with(ext));
+        if parsed {
+            total = total.saturating_add(entry.size());
+        }
+    }
+    if total > budget {
+        return Err(ContentError::FileOperation(format!("the document expands to more than {} MiB", budget >> 20)));
+    }
+    Ok(())
 }
 
 /// Resolve a relationship `target` against the directory of the part that
@@ -279,6 +331,27 @@ mod tests {
         assert_eq!(html.content, "# T\n\nTexte");
         assert_eq!(html.metadata["language"], "fr");
         assert_eq!(html.metadata["author"], "Zed");
+    }
+
+    #[test]
+    fn decompression_is_budgeted_per_document() {
+        use testutil::zip_bytes;
+        let part = vec![b'a'; 4096];
+        let bytes = zip_bytes(&[("one.xml", &part), ("two.xml", &part), ("three.xml", &part), ("photo.jpg", &part)]);
+
+        // Each read, re-reads included, draws on one budget for the document.
+        let mut package = Package::with_budget(&bytes, 10_000).unwrap();
+        assert_eq!(package.read("one.xml").unwrap().unwrap().len(), 4096);
+        assert_eq!(package.read("one.xml").unwrap().unwrap().len(), 4096);
+        let error = package.read("two.xml").unwrap_err();
+        assert!(matches!(error, ContentError::FileOperation(ref m) if m.contains("expands to more than")), "{error:?}");
+        assert_eq!(Package::open(&bytes).unwrap().remaining, MAX_DOCUMENT_BYTES);
+
+        // Third-party parsers are checked on declared sizes; pictures do not count.
+        assert!(check_zip_budget_within(&bytes, 3 * 4096).is_ok());
+        assert!(check_zip_budget_within(&bytes, 3 * 4096 - 1).is_err());
+        assert!(check_zip_budget(&bytes).is_ok());
+        assert!(check_zip_budget(b"not a zip").is_ok());
     }
 
     #[test]

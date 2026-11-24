@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -32,6 +33,52 @@ use crate::state::AppState;
 
 /// The `app` every command is filed under (the Python build's app name).
 pub const APP_NAME: &str = "open_notebook";
+
+/// How many jobs may be queued or running at once by default
+/// (`OPEN_NOTEBOOK_MAX_PENDING_JOBS`). Past it, [`JobQueue::submit`] answers
+/// 429 until the backlog drains. Generous so a full embedding rebuild of a
+/// large library still fits.
+pub const DEFAULT_MAX_PENDING_JOBS: usize = 10_000;
+
+/// Finished jobs older than this many days are pruned by default
+/// (`OPEN_NOTEBOOK_JOB_RETENTION_DAYS`, `0` keeps them forever).
+pub const DEFAULT_JOB_RETENTION_DAYS: u64 = 30;
+
+/// How often the worker prunes old finished jobs.
+const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Rows deleted per retention statement, so one sweep never holds a huge transaction.
+const RETENTION_BATCH: usize = 1_000;
+
+/// Batches per sweep; whatever is left waits for the next sweep.
+const RETENTION_MAX_BATCHES: usize = 100;
+
+fn max_pending_from_env() -> usize {
+    match crate::config::env_nonempty("OPEN_NOTEBOOK_MAX_PENDING_JOBS") {
+        None => DEFAULT_MAX_PENDING_JOBS,
+        Some(raw) => match raw.trim().parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                tracing::warn!(
+                    "OPEN_NOTEBOOK_MAX_PENDING_JOBS={raw:?} is not a positive number; using {DEFAULT_MAX_PENDING_JOBS}"
+                );
+                DEFAULT_MAX_PENDING_JOBS
+            }
+        },
+    }
+}
+
+fn retention_days_from_env() -> u64 {
+    match crate::config::env_nonempty("OPEN_NOTEBOOK_JOB_RETENTION_DAYS") {
+        None => DEFAULT_JOB_RETENTION_DAYS,
+        Some(raw) => raw.trim().parse::<u64>().unwrap_or_else(|_| {
+            tracing::warn!(
+                "OPEN_NOTEBOOK_JOB_RETENTION_DAYS={raw:?} is not a whole number of days; using {DEFAULT_JOB_RETENTION_DAYS}"
+            );
+            DEFAULT_JOB_RETENTION_DAYS
+        }),
+    }
+}
 
 pub mod status {
     pub const NEW: &str = "new";
@@ -145,13 +192,27 @@ impl CommandRecord {
     }
 }
 
+/// A place in the queue, held from submission until the job's task ends
+/// (finished, failed or canceled). Dropping it frees the place.
+pub struct PendingSlot(Arc<AtomicUsize>);
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 struct Inner {
     db: Db,
     handlers: RwLock<HashMap<String, Registered>>,
-    sender: mpsc::UnboundedSender<String>,
-    receiver: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
+    // Unbounded, but every message carries a `PendingSlot`, so the number of
+    // queued and running jobs is capped by `max_pending`.
+    sender: mpsc::UnboundedSender<(String, PendingSlot)>,
+    receiver: Mutex<Option<mpsc::UnboundedReceiver<(String, PendingSlot)>>>,
     running: Mutex<HashMap<String, AbortHandle>>,
     permits: Arc<Semaphore>,
+    pending: Arc<AtomicUsize>,
+    max_pending: AtomicUsize,
 }
 
 /// The job queue. Cheap to clone.
@@ -171,6 +232,8 @@ impl JobQueue {
                 receiver: Mutex::new(Some(receiver)),
                 running: Mutex::new(HashMap::new()),
                 permits: Arc::new(Semaphore::new(max_concurrent.max(1))),
+                pending: Arc::new(AtomicUsize::new(0)),
+                max_pending: AtomicUsize::new(max_pending_from_env()),
             }),
         }
     }
@@ -229,13 +292,57 @@ impl JobQueue {
             .ok_or_else(|| AppError::database("Command record has no id"))
     }
 
-    /// Queue a job and return its `command:<id>` immediately.
+    /// Change how many jobs may be queued or running at once.
+    pub fn set_max_pending(&self, max: usize) {
+        self.inner.max_pending.store(max.max(1), Ordering::SeqCst);
+    }
+
+    /// Jobs queued or running right now.
+    pub fn pending(&self) -> usize {
+        self.inner.pending.load(Ordering::SeqCst)
+    }
+
+    /// Take a place in the queue, or fail with 429 when it is full. Lets a
+    /// caller check for room before doing something it cannot undo, then
+    /// [`JobQueue::submit_reserved`].
+    pub fn reserve(&self) -> AppResult<PendingSlot> {
+        let max = self.inner.max_pending.load(Ordering::SeqCst);
+        let pending = &self.inner.pending;
+        let mut current = pending.load(Ordering::SeqCst);
+        loop {
+            if current >= max {
+                tracing::warn!("Refused a background job: {max} jobs are already queued or running");
+                return Err(AppError::RateLimit(format!(
+                    "Too many background jobs are queued ({max}). Wait for some to finish and try again."
+                )));
+            }
+            match pending.compare_exchange_weak(current, current + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Ok(PendingSlot(pending.clone())),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// A place in the queue that ignores the limit (jobs resumed at start-up).
+    fn force_reserve(&self) -> PendingSlot {
+        self.inner.pending.fetch_add(1, Ordering::SeqCst);
+        PendingSlot(self.inner.pending.clone())
+    }
+
+    /// Queue a job and return its `command:<id>` immediately. Fails with 429
+    /// (retryable) when too many jobs are already queued or running.
     pub async fn submit(&self, name: &str, args: Json) -> AppResult<String> {
+        let slot = self.reserve()?;
+        self.submit_reserved(slot, name, args).await
+    }
+
+    /// [`JobQueue::submit`] with a place taken earlier by [`JobQueue::reserve`].
+    pub async fn submit_reserved(&self, slot: PendingSlot, name: &str, args: Json) -> AppResult<String> {
         let id = self.create_record(name, &args).await?;
         tracing::info!("Submitted command job: {id} for {APP_NAME}.{name}");
         self.inner
             .sender
-            .send(id.clone())
+            .send((id.clone(), slot))
             .map_err(|_| AppError::internal("The background worker is not running"))?;
         Ok(id)
     }
@@ -354,20 +461,38 @@ impl JobQueue {
             .await?;
         for row in &pending {
             if let Some(id) = row.get("id").and_then(Json::as_str) {
-                let _ = self.inner.sender.send(id.to_string());
+                let _ = self.inner.sender.send((id.to_string(), self.force_reserve()));
             }
         }
         if !pending.is_empty() {
             tracing::info!("Resuming {} queued background job(s)", pending.len());
         }
 
+        let retention_days = retention_days_from_env();
+        if retention_days > 0 {
+            let queue = self.clone();
+            tokio::spawn(async move {
+                let mut every = tokio::time::interval(RETENTION_SWEEP_INTERVAL);
+                loop {
+                    every.tick().await;
+                    match queue.prune_finished(retention_days).await {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!("Pruned {n} finished background job(s) older than {retention_days} days"),
+                        Err(e) => tracing::warn!("Could not prune old background jobs: {e}"),
+                    }
+                }
+            });
+        }
+
         let queue = self.clone();
         tokio::spawn(async move {
-            while let Some(id) = receiver.recv().await {
+            while let Some((id, slot)) = receiver.recv().await {
                 let inner = queue.inner.clone();
                 let state = state.clone();
                 let job_id = id.clone();
                 let task = tokio::spawn(async move {
+                    // Held until this task ends, however it ends (an abort drops it too).
+                    let _slot = slot;
                     let Ok(_permit) = inner.permits.clone().acquire_owned().await else {
                         return;
                     };
@@ -384,6 +509,56 @@ impl JobQueue {
             }
         });
         Ok(())
+    }
+}
+
+impl JobQueue {
+    /// Delete finished jobs (completed, failed, canceled) last touched more
+    /// than `days` days ago. Jobs still linked from a source, an episode or a
+    /// meeting are kept, since their status is still shown, but their
+    /// arguments are emptied (`{}`). Queued and running jobs are never touched.
+    /// Returns how many rows were deleted.
+    pub async fn prune_finished(&self, days: u64) -> AppResult<usize> {
+        if days == 0 {
+            return Ok(0);
+        }
+        // `days` is a number from our own config, not user input.
+        let old = format!(
+            "status IN $done AND (updated ?? created) != NONE AND (updated ?? created) < time::now() - {days}d"
+        );
+        let done = [status::COMPLETED, status::FAILED, status::CANCELED];
+        let refs = "LET $linked = array::union(
+                (SELECT VALUE command FROM source WHERE command != NONE),
+                (SELECT VALUE command FROM episode WHERE command != NONE)
+            );
+            LET $meeting_jobs = (SELECT VALUE summary_job FROM meeting WHERE type::is::string(summary_job) AND summary_job != '');";
+        let mut deleted = 0;
+        for _ in 0..RETENTION_MAX_BATCHES {
+            let rows = self
+                .inner
+                .db
+                .query_last(
+                    &format!(
+                        "{refs}
+                        LET $gone = (SELECT VALUE id FROM command WHERE {old}
+                            AND id NOT IN $linked AND type::string(id) NOT IN $meeting_jobs LIMIT $batch);
+                        DELETE command WHERE id IN $gone RETURN NONE;
+                        RETURN array::len($gone);"
+                    ),
+                    Params::new().set("done", done).set("batch", RETENTION_BATCH),
+                )
+                .await?;
+            let n = rows.first().and_then(Json::as_u64).unwrap_or(0) as usize;
+            deleted += n;
+            if n < RETENTION_BATCH {
+                break;
+            }
+        }
+        self.inner
+            .db
+            .query(&format!("UPDATE command SET args = {{}} WHERE {old} AND args != NONE AND args != {{}} RETURN NONE"), Params::new().set("done", done))
+            .await?;
+        Ok(deleted)
     }
 }
 
@@ -602,6 +777,88 @@ mod tests {
         assert_eq!(interrupted.status_str(), status::FAILED);
         let queued = state.jobs.wait(queued["id"].as_str().unwrap(), Duration::from_secs(5)).await.unwrap();
         assert_eq!(queued.status_str(), status::COMPLETED);
+    }
+
+    /// Issue #34: the queue is capped; the cap frees as jobs finish, and jobs
+    /// resumed at start-up are never refused.
+    #[tokio::test]
+    async fn the_queue_refuses_jobs_past_its_cap_and_frees_places() {
+        let app = crate::testing::TestApp::new().await;
+        let jobs = &app.state.jobs;
+        jobs.register("zz_gate", RetryPolicy::once(), |_ctx, args| async move {
+            tokio::time::sleep(Duration::from_millis(args["ms"].as_u64().unwrap_or(0))).await;
+            Ok(json!({}))
+        });
+        jobs.set_max_pending(2);
+        let slow = jobs.submit("zz_gate", json!({ "ms": 60_000 })).await.unwrap();
+        let quick = jobs.submit("zz_gate", json!({ "ms": 0 })).await.unwrap();
+        let before = app.state.db.query("SELECT id FROM command", Params::new()).await.unwrap().len();
+        let refused = jobs.submit("zz_gate", json!({ "ms": 0 })).await.unwrap_err();
+        assert!(matches!(refused, AppError::RateLimit(_)), "{refused:?}");
+        assert!(refused.is_retryable());
+        assert_eq!(app.state.db.query("SELECT id FROM command", Params::new()).await.unwrap().len(), before);
+
+        // A finished job and a canceled one both give their place back.
+        assert_eq!(app.wait_for_job(&quick).await, status::COMPLETED);
+        let again = jobs.submit("zz_gate", json!({ "ms": 0 })).await.unwrap();
+        assert_eq!(app.wait_for_job(&again).await, status::COMPLETED);
+        assert!(jobs.cancel(&slow).await.unwrap());
+        for _ in 0..200 {
+            if jobs.pending() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(jobs.pending(), 0);
+    }
+
+    /// Issue #34: finished jobs past the retention window are deleted;
+    /// recent, unfinished and still-linked ones are kept.
+    #[tokio::test]
+    async fn old_finished_jobs_are_pruned() {
+        let app = crate::testing::TestApp::new().await;
+        let db = &app.state.db;
+        let job = |status: &str| {
+            Doc::new().set("app", APP_NAME).set("name", "noop").set("status", status).set("args", json!({ "big": "x" }))
+        };
+        let id = |row: Json| row["id"].as_str().unwrap().to_string();
+        let old_done = id(db.create("command", job(status::COMPLETED)).await.unwrap());
+        let old_failed = id(db.create("command", job(status::FAILED)).await.unwrap());
+        let old_canceled = id(db.create("command", job(status::CANCELED)).await.unwrap());
+        let old_new = id(db.create("command", job(status::NEW)).await.unwrap());
+        let old_running = id(db.create("command", job(status::RUNNING)).await.unwrap());
+        let old_queued = id(db.create("command", job("queued")).await.unwrap());
+        let old_linked_source = id(db.create("command", job(status::COMPLETED)).await.unwrap());
+        let old_linked_meeting = id(db.create("command", job(status::COMPLETED)).await.unwrap());
+        let old_linked_episode = id(db.create("command", job(status::FAILED)).await.unwrap());
+        let recent_done = id(db.create("command", job(status::COMPLETED)).await.unwrap());
+        for old in [&old_done, &old_failed, &old_canceled, &old_new, &old_running, &old_queued, &old_linked_source, &old_linked_meeting, &old_linked_episode] {
+            db.query("UPDATE $id SET created = time::now() - 41d, updated = time::now() - 40d", Params::new().record("id", old))
+                .await
+                .unwrap();
+        }
+        db.create("source", Doc::new().record("command", &old_linked_source)).await.unwrap();
+        db.create("meeting", Doc::new().set("summary_job", &old_linked_meeting)).await.unwrap();
+        db.query("CREATE episode SET name = 'e', episode_profile = {}, speaker_profile = {}, command = $command", Params::new().record("command", &old_linked_episode))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.jobs.prune_finished(30).await.unwrap(), 3);
+        for gone in [&old_done, &old_failed, &old_canceled] {
+            assert!(app.state.jobs.get(gone).await.unwrap().is_none(), "{gone} pruned");
+        }
+        for kept in [&old_new, &old_running, &old_queued, &recent_done] {
+            let record = app.state.jobs.get(kept).await.unwrap().unwrap_or_else(|| panic!("{kept} kept"));
+            assert_eq!(record.args, Some(json!({ "big": "x" })), "{kept} untouched");
+        }
+        for linked in [&old_linked_source, &old_linked_meeting, &old_linked_episode] {
+            let record = app.state.jobs.get(linked).await.unwrap().unwrap_or_else(|| panic!("{linked} kept"));
+            assert!(record.is_terminal());
+            assert_eq!(record.args, Some(json!({})), "{linked} slimmed");
+        }
+        // Nothing left to do, and 0 days means keep forever.
+        assert_eq!(app.state.jobs.prune_finished(30).await.unwrap(), 0);
+        assert_eq!(app.state.jobs.prune_finished(0).await.unwrap(), 0);
     }
 
     #[tokio::test]

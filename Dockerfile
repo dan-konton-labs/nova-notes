@@ -41,6 +41,13 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/nova-notes /usr/local/bin/nova-notes
+COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/nova-entrypoint
+
+# Unprivileged runtime user. Prepare the image's data directory so Docker's
+# default volume initialization gives fresh volumes the right permissions.
+RUN groupadd --system --gid 10001 nova \
+    && useradd --system --uid 10001 --gid nova --home-dir /app --no-create-home --shell /usr/sbin/nologin nova \
+    && mkdir -p /app/data && chown nova:nova /app/data
 
 # Same data path as the Python image, so file paths stored in the database
 # (uploads, podcasts, note files) stay valid on the same volume.
@@ -54,10 +61,13 @@ WORKDIR /app
 VOLUME ["/app/data"]
 EXPOSE 5055
 
-# Runs as root, like the Python image: the existing notebook_data volume is
-# owned by root. Revisit once the volume's ownership is migrated.
+# The entrypoint drops to nova before checking data directory access. It
+# never changes ownership of a mounted volume. Back up legacy volumes and
+# prepare their permissions for 10001:10001 offline before upgrading.
+# Use `--user 10001:10001` to never start as root. `NOVA_RUN_AS_ROOT=true`
+# bypasses both the privilege drop and the check; use only for break-glass recovery.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -fsS http://127.0.0.1:5055/health || exit 1
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/nova-entrypoint"]
 CMD ["nova-notes"]

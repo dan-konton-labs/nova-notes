@@ -14,6 +14,7 @@ pub mod explainers;
 pub mod generation_jobs;
 pub mod infographics;
 pub mod insights;
+pub mod login_sessions;
 pub mod meetings;
 pub mod models;
 pub mod note_docs;

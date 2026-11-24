@@ -15,11 +15,23 @@ use nn_llm::{AiError, AiResult, TextStream};
 
 use crate::error::transport_error;
 
+/// Longest line accepted in a streamed response (SSE or NDJSON).
+pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+/// Largest SSE event (all its `data:` lines together).
+pub const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
+/// Longest a streamed reply may run in total, however steadily data arrives.
+pub const MAX_STREAM_DURATION: Duration = Duration::from_secs(60 * 60);
+
 /// Splits a byte stream into lines. Accepts `\n`, `\r\n` and bare `\r`
 /// terminators, and only decodes UTF-8 once a line is complete.
+///
+/// A line longer than [`MAX_LINE_BYTES`] is not buffered: the excess is
+/// dropped and [`overflowed`](Self::overflowed) turns true for good, so the
+/// caller can end the stream.
 #[derive(Debug, Default)]
 pub struct LineBuffer {
     buf: Vec<u8>,
+    overflowed: bool,
     /// The previous byte was `\r`, so a directly following `\n` belongs to
     /// the same terminator.
     after_cr: bool,
@@ -43,11 +55,20 @@ impl LineBuffer {
                 }
                 _ => {
                     self.after_cr = false;
-                    self.buf.push(byte);
+                    if self.buf.len() < MAX_LINE_BYTES {
+                        self.buf.push(byte);
+                    } else {
+                        self.overflowed = true;
+                    }
                 }
             }
         }
         lines
+    }
+
+    /// Whether a line ever exceeded [`MAX_LINE_BYTES`].
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
     }
 
     /// Returns the unterminated remainder at end of stream, if any.
@@ -86,6 +107,8 @@ pub struct SseParser {
     lines: LineBuffer,
     event: Option<String>,
     data: Vec<String>,
+    data_bytes: usize,
+    overflowed: bool,
 }
 
 impl SseParser {
@@ -101,6 +124,12 @@ impl SseParser {
             }
         }
         events
+    }
+
+    /// Whether a line exceeded [`MAX_LINE_BYTES`] or an event
+    /// [`MAX_EVENT_BYTES`]. Oversized events are dropped, not dispatched.
+    pub fn overflowed(&self) -> bool {
+        self.overflowed || self.lines.overflowed()
     }
 
     /// Flushes an event the server did not terminate with a blank line.
@@ -123,7 +152,14 @@ impl SseParser {
             None => (line, ""),
         };
         match field {
-            "data" => self.data.push(value.to_string()),
+            "data" => {
+                self.data_bytes += value.len() + 1;
+                if self.data_bytes > MAX_EVENT_BYTES {
+                    self.overflowed = true;
+                } else {
+                    self.data.push(value.to_string());
+                }
+            }
             "event" => self.event = Some(value.to_string()),
             _ => {}
         }
@@ -132,7 +168,9 @@ impl SseParser {
 
     fn dispatch(&mut self) -> Option<SseEvent> {
         let event = self.event.take();
-        if self.data.is_empty() {
+        self.data_bytes = 0;
+        if self.data.is_empty() || self.overflowed {
+            self.data.clear();
             return None;
         }
         let data = std::mem::take(&mut self.data).join("\n");
@@ -189,6 +227,13 @@ impl Framer {
         }
     }
 
+    fn overflowed(&self) -> bool {
+        match self {
+            Framer::Sse(parser) => parser.overflowed(),
+            Framer::NdJson(lines) => lines.overflowed(),
+        }
+    }
+
     fn finish(&mut self) -> Vec<Frame> {
         match self {
             Framer::Sse(parser) => parser.finish().into_iter().map(Frame::from).collect(),
@@ -211,9 +256,10 @@ impl Frame {
 
 /// Decodes a stream of body chunks into text deltas.
 ///
-/// `idle` bounds the wait for each chunk (not the whole reply), so long
-/// answers are not cut off while a stalled connection still fails. The stream
-/// ends after the first error.
+/// `idle` bounds the wait for each chunk, so long answers are not cut off
+/// while a stalled connection still fails; [`MAX_STREAM_DURATION`] bounds the
+/// whole reply, and [`MAX_LINE_BYTES`] / [`MAX_EVENT_BYTES`] its frames. The
+/// stream ends after the first error.
 pub(crate) fn decode_stream<S, D>(body: S, framing: Framing, idle: Duration, provider: String, mut decode: D) -> TextStream
 where
     S: Stream<Item = AiResult<Bytes>> + Send + 'static,
@@ -222,8 +268,24 @@ where
     let stream = async_stream::stream! {
         let mut body = Box::pin(body);
         let mut framer = Framer::new(framing);
+        let deadline = tokio::time::Instant::now() + MAX_STREAM_DURATION;
         'read: loop {
-            let (frames, at_end) = match tokio::time::timeout(idle, body.next()).await {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                yield Err(AiError::Timeout(format!(
+                    "{provider}: the streamed reply took longer than {} minutes",
+                    MAX_STREAM_DURATION.as_secs() / 60
+                )));
+                break;
+            }
+            let (frames, at_end) = match tokio::time::timeout(idle.min(remaining), body.next()).await {
+                Err(_) if remaining <= idle => {
+                    yield Err(AiError::Timeout(format!(
+                        "{provider}: the streamed reply took longer than {} minutes",
+                        MAX_STREAM_DURATION.as_secs() / 60
+                    )));
+                    break;
+                }
                 Err(_) => {
                     yield Err(AiError::Timeout(format!(
                         "{provider}: no data received for {} seconds while streaming",
@@ -235,7 +297,17 @@ where
                     yield Err(err);
                     break;
                 }
-                Ok(Some(Ok(chunk))) => (framer.push(&chunk), false),
+                Ok(Some(Ok(chunk))) => {
+                    let frames = framer.push(&chunk);
+                    if framer.overflowed() {
+                        yield Err(AiError::Provider {
+                            status: None,
+                            message: format!("{provider}: unexpected response: a streamed event is too large"),
+                        });
+                        break;
+                    }
+                    (frames, false)
+                }
                 Ok(None) => (framer.finish(), true),
             };
             for frame in frames {
@@ -435,5 +507,49 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0], Ok("a".to_string()));
         assert!(out[1].as_ref().unwrap_err().contains("no data received for 30 seconds"));
+    }
+
+    #[test]
+    fn an_endless_line_is_not_buffered() {
+        let mut lines = LineBuffer::new();
+        let chunk = vec![b'a'; 1024 * 1024];
+        for _ in 0..(MAX_LINE_BYTES / chunk.len() + 4) {
+            assert!(lines.push(&chunk).is_empty());
+        }
+        assert!(lines.overflowed());
+        assert!(lines.buf.len() <= MAX_LINE_BYTES);
+    }
+
+    #[test]
+    fn an_oversized_event_is_dropped_and_flagged() {
+        let mut parser = SseParser::new();
+        let line = format!("data: {}\n", "x".repeat(1024 * 1024));
+        for _ in 0..(MAX_EVENT_BYTES / (1024 * 1024) + 2) {
+            assert!(parser.push(line.as_bytes()).is_empty());
+        }
+        assert!(parser.overflowed());
+        assert!(parser.data.iter().map(String::len).sum::<usize>() <= MAX_EVENT_BYTES);
+        assert!(parser.push(b"\n").is_empty(), "the oversized event is not dispatched");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_stream_line_ends_the_stream() {
+        let big = "a".repeat(MAX_LINE_BYTES + 10);
+        let body = stream::iter(vec![Ok(Bytes::from("data: ok\n\n")), Ok(Bytes::from(big))]);
+        let out = collect(decode_stream(body, Framing::NdJson, IDLE, "test".into(), echo)).await;
+        assert_eq!(out.len(), 2, "{:?}", out.iter().map(|r| r.as_ref().map(String::len)).collect::<Vec<_>>());
+        assert!(out[1].as_ref().unwrap_err().contains("too large"), "{:?}", out[1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_trickled_stream_hits_the_total_deadline() {
+        // A keep-alive comment every 10 s never trips the idle timeout.
+        let body = stream::unfold((), |()| async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Some((Ok(Bytes::from(": keep-alive\n")), ()))
+        });
+        let out = collect(decode_stream(body, Framing::Sse, Duration::from_secs(30), "test".into(), echo)).await;
+        assert_eq!(out.len(), 1);
+        assert!(out[0].as_ref().unwrap_err().contains("took longer than 60 minutes"), "{:?}", out[0]);
     }
 }

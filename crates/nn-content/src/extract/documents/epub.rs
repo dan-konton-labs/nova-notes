@@ -1,9 +1,14 @@
 //! EPUB extraction: the chapters named by the package spine, in reading
 //! order, each converted from XHTML to Markdown.
 
+use std::collections::{HashMap, HashSet};
+
 use super::{parent_dir, percent_decode, resolve_part, DocOutput, Package};
 use crate::error::ContentError;
 use crate::extract::html::{html_to_markdown, HtmlOptions};
+
+/// Most chapters read from one book.
+const MAX_CHAPTERS: usize = 10_000;
 
 pub(super) fn extract(bytes: &[u8]) -> Result<DocOutput, ContentError> {
     let mut package = Package::open(bytes)?;
@@ -45,12 +50,24 @@ pub(super) fn extract(bytes: &[u8]) -> Result<DocOutput, ContentError> {
         })
         .unwrap_or_default();
 
+    let manifest: HashMap<&str, (&String, &String, &String)> =
+        manifest.iter().rev().map(|(id, part, media_type, properties)| (id.as_str(), (part, media_type, properties))).collect();
     let options = HtmlOptions { base_url: None, main_content: false };
     let mut chapters = Vec::new();
+    // A spine that names the same chapter again (or names thousands of
+    // chapters) must not make us read and convert it again and again.
+    let mut seen: HashSet<&str> = HashSet::new();
     for idref in &spine {
-        let Some((_, part, media_type, properties)) = manifest.iter().find(|(id, ..)| id == idref) else {
+        let Some(&(part, media_type, properties)) = manifest.get(idref.as_str()) else {
             continue;
         };
+        if !seen.insert(part.as_str()) {
+            continue;
+        }
+        if seen.len() > MAX_CHAPTERS {
+            tracing::warn!("EPUB spine names more than {MAX_CHAPTERS} chapters; the rest are skipped");
+            break;
+        }
         let is_markup = media_type.contains("html") || media_type.contains("xml") || media_type.is_empty();
         if !is_markup || properties.split_whitespace().any(|p| p == "nav") {
             continue;
@@ -120,6 +137,30 @@ pub(crate) mod tests {
             out.content,
             "# Chapter One\n\nIt began with a *question*.\n\n# Chapter Two\n\nAnd ended with an answer.\n\n- First\n- Second"
         );
+    }
+
+    fn epub_with(spine: &str, chapter: &str) -> Vec<u8> {
+        let container = r#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="content.opf"/></rootfiles></container>"#;
+        let opf = format!(
+            r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf"><metadata/><manifest><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/><item id="alias" href="c1.xhtml" media-type="application/xhtml+xml"/></manifest><spine>{spine}</spine></package>"#
+        );
+        zip_bytes(&[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", container.as_bytes()),
+            ("content.opf", opf.as_bytes()),
+            ("c1.xhtml", chapter.as_bytes()),
+        ])
+    }
+
+    #[test]
+    fn a_chapter_named_again_and_again_is_read_once() {
+        let spine = r#"<itemref idref="c1"/><itemref idref="alias"/>"#.repeat(50_000);
+        let chapter = format!("<html><body><p>{}</p></body></html>", "word ".repeat(200_000));
+        let bytes = epub_with(&spine, &chapter);
+        let started = std::time::Instant::now();
+        let out = extract(&bytes).unwrap();
+        assert_eq!(out.metadata["chapters"], 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "took {:?}", started.elapsed());
     }
 
     #[test]

@@ -252,7 +252,9 @@ pub fn resolve_public_base_url(
             PodcastError::Configuration(
                 "The Podcast Feed needs an HTTPS address. Set OPEN_NOTEBOOK_PUBLIC_URL \
                  to the HTTPS origin podcast apps should use (for example \
-                 https://your-host.your-tailnet.ts.net:8502)."
+                 https://your-host.your-tailnet.ts.net:8502), or, behind a reverse \
+                 proxy that sets X-Forwarded-Proto and X-Forwarded-Host, set \
+                 OPEN_NOTEBOOK_TRUST_PROXY_HEADERS=true."
                 .into(),
         )
     })

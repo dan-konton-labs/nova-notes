@@ -58,8 +58,19 @@ pub fn redirect(headers: &HeaderMap, target: &str) -> Response {
 
 /// A same-site relative path (`/...`), or `None` for anything that could
 /// leave the site (`//host`, `/\host`, absolute URLs).
+///
+/// Browsers drop tab, CR and LF from URLs and read `\` as `/`, so
+/// `/<TAB>/evil.example` would become `//evil.example`: any control character
+/// or backslash is refused outright. What is left must resolve, against a
+/// placeholder origin, to that same origin.
 pub fn safe_path(path: Option<&str>) -> Option<String> {
-    path.filter(|p| p.starts_with('/') && !p.starts_with("//") && !p.starts_with("/\\")).map(String::from)
+    let path = path?;
+    if !path.starts_with('/') || path.starts_with("//") || path.chars().any(|c| c.is_control() || c == '\\') {
+        return None;
+    }
+    let base = url::Url::parse("http://nova-notes.invalid/").ok()?;
+    let joined = base.join(path).ok()?;
+    (joined.origin() == base.origin()).then(|| path.to_string())
 }
 
 /// [`safe_path`], falling back to `fallback`.
@@ -210,6 +221,10 @@ mod tests {
         assert_eq!(safe_path(Some("//evil.example")), None);
         assert_eq!(safe_path(Some("/\\evil.example")), None);
         assert_eq!(safe_path(Some("https://evil.example")), None);
+        for bad in ["/\t/evil.example", "/\\evil", "/a\\b", "/\r\nX: y", "/\n", "/\u{7f}/x", "/\u{85}x", ""] {
+            assert_eq!(safe_path(Some(bad)), None, "{bad:?}");
+        }
+        assert_eq!(safe_path(Some("/notebooks/x?y=1#z")).as_deref(), Some("/notebooks/x?y=1#z"));
         assert_eq!(safe_path_or(None, "/sources"), "/sources");
     }
 

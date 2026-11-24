@@ -57,6 +57,9 @@ pub enum AppError {
 
 pub type AppResult<T> = Result<T, AppError>;
 
+/// What clients see for a 500; the real error is logged.
+pub const INTERNAL_DETAIL: &str = "Internal server error. The details are in the server log.";
+
 impl AppError {
     pub fn not_found(msg: impl Into<String>) -> Self {
         Self::NotFound(msg.into())
@@ -105,7 +108,17 @@ impl AppError {
     }
 
     /// The `detail` string sent to clients.
+    ///
+    /// A 500 (database, file and internal errors, and any explicit 500) can
+    /// carry file paths, query text or database internals, so clients get
+    /// [`INTERNAL_DETAIL`] and the real text goes to the server log. Other
+    /// statuses keep their message: it is written for the user (what to fix,
+    /// what a provider said).
     pub fn detail(&self) -> String {
+        if self.status() == StatusCode::INTERNAL_SERVER_ERROR {
+            tracing::error!("{self}");
+            return INTERNAL_DETAIL.to_string();
+        }
         self.to_string()
     }
 
@@ -148,7 +161,8 @@ pub fn is_transaction_conflict(message: &str) -> bool {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status();
-        if status.is_server_error() {
+        // `detail()` logs a 500 itself.
+        if status.is_server_error() && status != StatusCode::INTERNAL_SERVER_ERROR {
             tracing::error!(%status, "{self}");
         }
         let mut response = (status, Json(serde_json::json!({ "detail": self.detail() }))).into_response();
@@ -232,5 +246,37 @@ mod tests {
         assert!(!AppError::invalid("bad").is_retryable());
         assert!(!AppError::ContextLength("too long".into()).is_retryable());
         assert!(AppError::RateLimit("slow down".into()).is_retryable());
+    }
+
+    /// 500s never show their internal text (paths, database errors); errors
+    /// written for the user keep theirs.
+    #[tokio::test]
+    async fn internal_text_stays_in_the_log() {
+        use http_body_util::BodyExt;
+        let secret = "/srv/data/uploads/x.pdf: Permission denied; SELECT * FROM credential";
+        for error in [
+            AppError::database(secret),
+            AppError::FileOperation(secret.into()),
+            AppError::internal(secret),
+            AppError::http(StatusCode::INTERNAL_SERVER_ERROR, format!("Error creating notebook: {secret}")),
+            AppError::from(std::io::Error::other(secret)),
+        ] {
+            assert_eq!(error.detail(), INTERNAL_DETAIL, "{error:?}");
+            assert!(error.to_string().contains(secret), "Display keeps the real text for logs and retries");
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), serde_json::json!({ "detail": INTERNAL_DETAIL }));
+        }
+        for (error, text) in [
+            (AppError::config("No default chat model is configured. Set one in Manage → Models."), "Manage → Models"),
+            (AppError::not_found("Notebook not found"), "Notebook not found"),
+            (AppError::ExternalService("The provider rejected the request".into()), "provider rejected"),
+            (AppError::Network("Could not reach the provider".into()), "Could not reach"),
+            (AppError::RateLimit("Too many requests".into()), "Too many requests"),
+            (AppError::http(StatusCode::SERVICE_UNAVAILABLE, "Vault sync is not configured"), "Vault sync"),
+        ] {
+            assert!(error.detail().contains(text), "{error:?}");
+        }
     }
 }

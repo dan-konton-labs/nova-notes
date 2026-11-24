@@ -256,6 +256,11 @@ fn view_title(library: &Library, view: &View) -> String {
     }
 }
 
+/// Restores focus mode before first paint. Allowed by hash in the page CSP
+/// (see `web::INLINE_SCRIPTS`).
+pub(crate) const FOCUS_INIT: &str =
+    r#"try{if(localStorage.getItem("nn-ws-focus")==="on")document.documentElement.classList.add("ws-focus");}catch(error){}"#;
+
 fn shell(state: &AppState, title: &str, library: &Library, view: &View, open: Option<&OpenNote>, fresh: bool) -> Markup {
     let auth = state.config.password.is_some();
     html! {
@@ -263,9 +268,7 @@ fn shell(state: &AppState, title: &str, library: &Library, view: &View, open: Op
         html lang="en" {
             head {
                 (head(title))
-                script { (PreEscaped(r#"
-                    try { if (localStorage.getItem("nn-ws-focus") === "on") document.documentElement.classList.add("ws-focus"); } catch (error) {}
-                "#)) }
+                script { (PreEscaped(FOCUS_INIT)) }
             }
             body.ws-body hx-headers=r#"{"X-Requested-With": "htmx"}"# {
                 div.ws #ws data-ws-pane=(if open.is_some() { "editor" } else { "list" }) {

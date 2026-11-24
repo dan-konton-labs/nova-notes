@@ -12,11 +12,17 @@ checkpoint format), on the same data volume, for example:
 
     docker compose run --rm --no-deps \\
         --entrypoint /app/.venv/bin/python \\
-        -v /opt/nova-build/nova-notes-rust/scripts:/scripts:ro \\
+        -v $(pwd)/scripts:/scripts:ro \\
         open_notebook /scripts/export_langgraph_chats.py
 
 The checkpoint file is never modified: it is copied with SQLite's backup API
 (a consistent snapshot even if the app is running) and the copy is read.
+
+The export holds the full chat history, so it is written with mode 0600.
+
+Trust: reading the checkpoints uses LangGraph's own serializer, which in some
+versions can unpickle Python objects. Only run this on a checkpoint database
+that no one else can write to.
 
 Output: one JSON object per chat session (thread):
     {"session": "chat_session:abc",
@@ -80,7 +86,7 @@ def export(checkpoints: str, out: str) -> dict:
             )
         ]
         stats = {"threads": 0, "messages": 0, "empty_threads": 0}
-        with open(out, "w", encoding="utf-8") as handle:
+        with open_private(out) as handle:
             for thread_id in threads:
                 found = saver.get_tuple({"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}})
                 values = (found.checkpoint.get("channel_values") or {}) if found else {}
@@ -108,6 +114,13 @@ def export(checkpoints: str, out: str) -> dict:
         return stats
     finally:
         os.unlink(copy_path)
+
+
+def open_private(path: str):
+    """Open `path` for writing as mode 0600, also when it already exists with looser permissions."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    return os.fdopen(fd, "w", encoding="utf-8")
 
 
 def main() -> int:

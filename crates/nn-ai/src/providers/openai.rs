@@ -326,7 +326,7 @@ impl LanguageModel for OpenAiChat {
     async fn chat(&self, messages: &[ChatMessage], options: &ChatOptions) -> AiResult<ChatResponse> {
         let ep = &self.endpoint;
         let response = self.request(messages, options, false).await?;
-        let body = response.bytes().await.map_err(|e| crate::error::transport_error(&ep.provider, e))?;
+        let body = crate::http::read_body(&ep.provider, response, crate::http::MAX_JSON_RESPONSE_BYTES).await?;
         let json: Value =
             serde_json::from_slice(&body).map_err(|_| ep.http.malformed("the response was not valid JSON"))?;
         let Some(choice) = json.pointer("/choices/0") else {

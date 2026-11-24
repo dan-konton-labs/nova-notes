@@ -12,7 +12,17 @@ use serde_json::Value;
 use crate::config::ProviderConfig;
 use crate::error::{http_error, transport_error};
 
+/// Largest JSON (or other non-audio) response body read from a provider.
+pub const MAX_JSON_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+/// Largest audio response read from a provider: raw audio, or JSON carrying
+/// base64 / hex audio (Gemini and MiniMax speech).
+pub const MAX_AUDIO_RESPONSE_BYTES: usize = 512 * 1024 * 1024;
+/// How much of an error response body is read to find the provider's message.
+pub const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
 /// The process-wide client used when the caller does not bring its own.
+/// Redirects are never followed: a provider endpoint that redirects is an
+/// error, so keys in custom headers cannot follow a redirect elsewhere.
 pub(crate) fn shared_client() -> reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT
@@ -20,10 +30,44 @@ pub(crate) fn shared_client() -> reqwest::Client {
             reqwest::Client::builder()
                 .user_agent("nova-notes")
                 .connect_timeout(Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default()
         })
         .clone()
+}
+
+/// Reads a response body, failing once it exceeds `cap` bytes.
+pub(crate) async fn read_body(provider: &str, mut response: Response, cap: usize) -> AiResult<Bytes> {
+    let too_large = || AiError::Provider {
+        status: None,
+        message: format!("{provider}: unexpected response: the response is larger than {} MiB", cap / (1024 * 1024)),
+    };
+    if response.content_length().is_some_and(|len| len > cap as u64) {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| transport_error(provider, e))? {
+        if body.len() + chunk.len() > cap {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
+}
+
+/// Reads at most `cap` bytes of a body and drops the rest (error bodies,
+/// where only the start matters). A read failure ends the body early.
+pub(crate) async fn read_prefix(mut response: Response, cap: usize) -> Vec<u8> {
+    let mut body = Vec::new();
+    while let Ok(Some(chunk)) = response.chunk().await {
+        let room = cap - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if body.len() >= cap {
+            break;
+        }
+    }
+    body
 }
 
 /// A client bound to one provider: knows its name (for error messages), its
@@ -76,17 +120,25 @@ impl Http {
             return Ok(response);
         }
         // A body that cannot be read still leaves the status to report.
-        let body = response.text().await.unwrap_or_default();
+        let body = read_prefix(response, MAX_ERROR_BODY_BYTES).await;
+        let body = String::from_utf8_lossy(&body);
         Err(http_error(&self.provider, status.as_u16(), &body, self.secret.as_deref()))
     }
 
     pub async fn json(&self, request: RequestBuilder) -> AiResult<Value> {
+        self.json_capped(request, MAX_JSON_RESPONSE_BYTES).await
+    }
+
+    /// [`json`](Self::json) with a body limit other than
+    /// [`MAX_JSON_RESPONSE_BYTES`] (JSON that carries audio).
+    pub async fn json_capped(&self, request: RequestBuilder, cap: usize) -> AiResult<Value> {
         let response = self.send(request).await?;
-        let body = response.bytes().await.map_err(|e| transport_error(&self.provider, e))?;
+        let body = read_body(&self.provider, response, cap).await?;
         serde_json::from_slice(&body).map_err(|_| self.malformed("the response was not valid JSON"))
     }
 
-    /// Returns the body and its `Content-Type` (without parameters).
+    /// Returns the body (up to [`MAX_AUDIO_RESPONSE_BYTES`]) and its
+    /// `Content-Type` (without parameters).
     pub async fn bytes(&self, request: RequestBuilder) -> AiResult<(Bytes, Option<String>)> {
         let response = self.send(request).await?;
         let content_type = response
@@ -95,7 +147,7 @@ impl Http {
             .and_then(|v| v.to_str().ok())
             .map(|v| v.split(';').next().unwrap_or(v).trim().to_ascii_lowercase())
             .filter(|v| !v.is_empty());
-        let body = response.bytes().await.map_err(|e| transport_error(&self.provider, e))?;
+        let body = read_body(&self.provider, response, MAX_AUDIO_RESPONSE_BYTES).await?;
         Ok((body, content_type))
     }
 
@@ -199,5 +251,46 @@ mod tests {
         let http = http(&ProviderConfig::default());
         let err = http.json(http.client.get(server.uri())).await.unwrap_err();
         assert!(matches!(err, AiError::Provider { status: None, .. }));
+    }
+
+    #[tokio::test]
+    async fn bodies_over_the_cap_are_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(100))).mount(&server).await;
+        let response = shared_client().get(server.uri()).send().await.unwrap();
+        let err = read_body("testprov", response, 10).await.unwrap_err();
+        assert!(err.to_string().contains("larger than"), "{err}");
+        let response = shared_client().get(server.uri()).send().await.unwrap();
+        assert_eq!(read_body("testprov", response, 100).await.unwrap().len(), 100);
+        let response = shared_client().get(server.uri()).send().await.unwrap();
+        assert_eq!(read_prefix(response, 7).await, b"xxxxxxx");
+    }
+
+    #[tokio::test]
+    async fn redirects_are_not_followed_so_key_headers_stay_put() {
+        let target = MockServer::start().await;
+        Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({}))).mount(&target).await;
+        let redirector = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", format!("{}/stolen", target.uri())))
+            .mount(&redirector)
+            .await;
+        let http = http(&ProviderConfig::default().with_api_key("sk-ant-secret"));
+        let request = http.client.get(format!("{}/v1/models", redirector.uri())).header("x-api-key", "sk-ant-secret");
+        let err = http.json(request).await.unwrap_err();
+        assert!(err.to_string().contains("HTTP 302"), "{err}");
+        assert!(target.received_requests().await.unwrap().is_empty(), "the redirect was followed");
+    }
+
+    #[tokio::test]
+    async fn non_json_error_pages_are_not_reflected() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("consul: internal secret value"))
+            .mount(&server)
+            .await;
+        let http = http(&ProviderConfig::default());
+        let err = http.json(http.client.get(server.uri())).await.unwrap_err();
+        assert_eq!(err.to_string(), "testprov: internal server error (HTTP 500)");
     }
 }

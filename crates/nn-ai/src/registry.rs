@@ -464,10 +464,99 @@ pub fn provider(name: &str) -> Option<&'static ProviderSpec> {
     PROVIDERS.iter().find(|spec| spec.name == wanted)
 }
 
+/// Where a stored credential's `base_url` may point for this provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseUrlRule {
+    /// Any host: the provider is a server the user runs or picks (Ollama,
+    /// oMLX, Azure, the OpenAI- and Anthropic-compatible providers).
+    AnyHost,
+    /// Only `https` URLs on one of these domains or their subdomains: the
+    /// provider's own API, including its regional endpoints.
+    Domains(&'static [&'static str]),
+    /// The provider takes no base URL (Vertex AI builds its host from the
+    /// location).
+    None,
+}
+
+/// The [`BaseUrlRule`] of a provider (normalised name). Unknown providers
+/// get [`BaseUrlRule::None`].
+pub fn base_url_rule(provider: &str) -> BaseUrlRule {
+    let domains: &'static [&'static str] = match normalize_provider_name(provider).as_str() {
+        "ollama" | "omlx" | "azure" | "openai_compatible" | "anthropic_compatible" => return BaseUrlRule::AnyHost,
+        "openai" => &["openai.com"],
+        "anthropic" => &["anthropic.com"],
+        // Exact API hosts where the parent domain also serves other
+        // tenants' content (Cloud Storage, Function Compute, ...).
+        "google" => &["generativelanguage.googleapis.com"],
+        "groq" => &["groq.com"],
+        "mistral" => &["mistral.ai"],
+        "deepseek" => &["deepseek.com"],
+        "xai" => &["x.ai"],
+        "openrouter" => &["openrouter.ai"],
+        "dashscope" => &["dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com"],
+        "minimax" => &["minimax.io", "minimaxi.com", "minimax.cn", "minimax.chat"],
+        "novita" => &["novita.ai"],
+        "siliconflow" => &["siliconflow.com", "siliconflow.cn"],
+        "zai" => &["z.ai", "bigmodel.cn"],
+        "ppq" => &["ppq.ai"],
+        "cohere" => &["cohere.com", "cohere.ai"],
+        "voyage" => &["voyageai.com"],
+        "elevenlabs" => &["elevenlabs.io"],
+        "deepgram" => &["deepgram.com"],
+        _ => return BaseUrlRule::None,
+    };
+    BaseUrlRule::Domains(domains)
+}
+
+impl BaseUrlRule {
+    /// Whether a URL with this scheme and host (lower-case ASCII) is allowed.
+    pub fn allows(&self, scheme: &str, host: &str) -> bool {
+        match self {
+            BaseUrlRule::AnyHost => true,
+            BaseUrlRule::None => false,
+            BaseUrlRule::Domains(domains) => {
+                let host = host.trim_end_matches('.').to_ascii_lowercase();
+                scheme.eq_ignore_ascii_case("https")
+                    && domains.iter().any(|d| host == *d || host.strip_suffix(d).is_some_and(|rest| rest.ends_with('.')))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn base_url_rules_cover_every_provider() {
+        for spec in PROVIDERS {
+            let rule = base_url_rule(spec.name);
+            match spec.name {
+                "vertex" => assert_eq!(rule, BaseUrlRule::None),
+                "ollama" | "omlx" | "azure" | "openai_compatible" | "anthropic_compatible" => {
+                    assert_eq!(rule, BaseUrlRule::AnyHost)
+                }
+                other => assert!(matches!(rule, BaseUrlRule::Domains(d) if !d.is_empty()), "{other}"),
+            }
+        }
+        let openai = base_url_rule("openai");
+        assert!(openai.allows("https", "api.openai.com"));
+        assert!(openai.allows("HTTPS", "API.OpenAI.com."));
+        assert!(!openai.allows("http", "api.openai.com"), "plain http is refused");
+        assert!(!openai.allows("https", "attacker.example"));
+        assert!(!openai.allows("https", "evilopenai.com"));
+        assert!(!openai.allows("https", "openai.com.attacker.example"));
+        assert!(base_url_rule("zai").allows("https", "open.bigmodel.cn"));
+        // Shared cloud domains are narrowed to the API host.
+        assert!(base_url_rule("google").allows("https", "generativelanguage.googleapis.com"));
+        assert!(!base_url_rule("google").allows("https", "storage.googleapis.com"));
+        assert!(base_url_rule("dashscope").allows("https", "dashscope-intl.aliyuncs.com"));
+        assert!(!base_url_rule("dashscope").allows("https", "attacker.oss-cn-hangzhou.aliyuncs.com"));
+        assert!(!base_url_rule("dashscope").allows("https", "fc.aliyuncs.com"));
+        assert!(base_url_rule("ollama").allows("http", "192.168.1.10"));
+        assert!(!base_url_rule("vertex").allows("https", "aiplatform.googleapis.com"));
+    }
 
     #[test]
     fn names_are_unique_and_ordered_as_declared() {

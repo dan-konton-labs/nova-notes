@@ -650,7 +650,7 @@ fn credential_form(provider: &ProviderInfoResponse, credential: Option<&Credenti
                     @if editing {
                         p.hint {
                             @if credential.is_some_and(|c| c.has_api_key) { "A key is stored. " }
-                            "Leave blank to keep the existing API key"
+                            "Leave blank to keep the existing API key (re-enter it to change the Base URL)"
                         }
                     }
                     @if let Some(docs) = &provider.docs_url {

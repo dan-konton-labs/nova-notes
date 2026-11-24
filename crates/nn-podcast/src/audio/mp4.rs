@@ -15,7 +15,7 @@ struct BoxHeader {
 }
 
 fn read_box<R: Read + Seek>(reader: &mut R, at: u64, limit: u64) -> Result<Option<BoxHeader>, String> {
-    if at + 8 > limit {
+    if at.checked_add(8).is_none_or(|header_end| header_end > limit) {
         return Ok(None);
     }
     let io = |e: std::io::Error| format!("could not read the MP4 file: {e}");
@@ -32,10 +32,13 @@ fn read_box<R: Read + Seek>(reader: &mut R, at: u64, limit: u64) -> Result<Optio
         }
         size => (u64::from(size), 8),
     };
-    if size < header_len || at + size > limit {
-        return Err("the MP4 file is damaged (a box runs past the end of the file)".into());
-    }
-    Ok(Some(BoxHeader { kind, payload: at + header_len, end: at + size }))
+    // `size >= header_len` also makes `end > at`, so every walk over boxes
+    // moves forward.
+    let end = at
+        .checked_add(size)
+        .filter(|&end| size >= header_len && end > at && end <= limit)
+        .ok_or("the MP4 file is damaged (a box runs past the end of the file)")?;
+    Ok(Some(BoxHeader { kind, payload: at + header_len, end }))
 }
 
 /// Find the first child box of type `kind` inside `start..end`.
@@ -191,6 +194,21 @@ mod tests {
         file.extend(mdat);
         file.extend(boxed(b"moov", &mvhd_v0(600, 1_500)));
         assert_eq!(duration(&file).unwrap(), 2.5);
+    }
+
+    /// Issue #34: a 64-bit box size that wraps `at + size` used to send the
+    /// search backwards and loop forever in release builds.
+    #[test]
+    fn box_sizes_that_overflow_are_damage() {
+        for size in [u64::MAX, u64::MAX - 7, u64::MAX - 19] {
+            let mut file = ftyp();
+            let mut mdat = 1u32.to_be_bytes().to_vec();
+            mdat.extend(b"mdat");
+            mdat.extend(size.to_be_bytes());
+            mdat.extend([0u8; 32]);
+            file.extend(mdat);
+            assert!(duration(&file).unwrap_err().contains("damaged"), "{size}");
+        }
     }
 
     #[test]

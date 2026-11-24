@@ -30,4 +30,4 @@ pub use extract::{
 };
 pub use text::{clean_thinking_content, parse_thinking_content};
 pub use tokens::token_count;
-pub use url_validation::{validate_url, UrlPolicy, UrlValidationError};
+pub use url_validation::{is_public_ip, validate_url, UrlPolicy, UrlValidationError};

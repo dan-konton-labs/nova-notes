@@ -28,7 +28,7 @@ pub const UPSTREAM_COUNT: i64 = 25;
 /// Fork migration `k` (1-based) is file / version `NOVA_BASE + k`.
 pub const NOVA_BASE: i64 = 99;
 pub const NOVA_COUNT: i64 = 7;
-pub const RUST_COUNT: i64 = 4;
+pub const RUST_COUNT: i64 = 5;
 
 /// Before the fork got its own track its migrations were upstream-track
 /// versions 26-29. Databases from that time get those records moved once.
@@ -249,12 +249,12 @@ mod tests {
 
         let version = run(&db).await.unwrap();
         assert!(version.is_current(), "{version:?}");
-        assert_eq!(version, SchemaVersion { upstream: 25, fork: 106, rust: 4 });
+        assert_eq!(version, SchemaVersion { upstream: 25, fork: 106, rust: 5 });
 
         // The schema is really there.
         let info = db.query_value("INFO FOR DB", Params::new()).await.unwrap();
         let tables = info["tables"].as_object().unwrap();
-        for table in ["notebook", "source", "note", "source_embedding", "source_insight", "chat_session", "transformation", "model", "credential", "episode", "episode_profile", "speaker_profile", "folder", "section", "meeting", "chat_message", "command", "note_pin"] {
+        for table in ["notebook", "source", "note", "source_embedding", "source_insight", "chat_session", "transformation", "model", "credential", "episode", "episode_profile", "speaker_profile", "folder", "section", "meeting", "chat_message", "command", "note_pin", "login_session"] {
             assert!(tables.contains_key(table), "missing table {table}");
         }
         assert!(info["functions"].as_object().unwrap().contains_key("text_search"));

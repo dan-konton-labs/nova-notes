@@ -88,6 +88,7 @@ pub(crate) async fn transcribe_file(
 ) -> Result<Extracted, ContentError> {
     let is_video = detected.kind == FileKind::Video;
     let kind = if is_video { "video" } else { "audio" };
+    refuse_playlists(path).await?;
     let model = ctx.speech_to_text.clone().ok_or_else(|| {
         ContentError::Configuration(format!(
             "transcribing {kind} needs a speech-to-text model, and none is configured"
@@ -171,6 +172,42 @@ pub(crate) async fn transcribe_file(
     })
 }
 
+/// Refuse an HLS playlist (`#EXTM3U`) or an ffconcat script that reached us
+/// as audio or video: `detect` falls back to the extension for binary data it
+/// does not recognise, and ffmpeg would follow such a file to other files.
+async fn refuse_playlists(path: &Path) -> Result<(), ContentError> {
+    use tokio::io::AsyncReadExt;
+
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| ContentError::FileOperation(format!("cannot read the file: {e}")))?;
+    let mut head = Vec::with_capacity(512);
+    file.take(512)
+        .read_to_end(&mut head)
+        .await
+        .map_err(|e| ContentError::FileOperation(format!("cannot read the file: {e}")))?;
+    if let Some(identified_type) = playlist_type(&head) {
+        return Err(ContentError::UnsupportedType {
+            identified_type: identified_type.to_string(),
+            reason: "playlists and concat scripts are not media files".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn playlist_type(head: &[u8]) -> Option<&'static str> {
+    let head = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
+    let start = head.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(head.len());
+    let head = &head[start..];
+    if head.starts_with(b"#EXTM3U") {
+        Some("application/vnd.apple.mpegurl")
+    } else if head.starts_with(b"ffconcat") {
+        Some("text/x-ffconcat")
+    } else {
+        None
+    }
+}
+
 /// Segment length in seconds: the configured length, capped so a segment at
 /// [`SEGMENT_BITRATE`] stays under 90% of the upload limit. A configured `0`
 /// means "do not split", so only the size cap applies.
@@ -245,6 +282,7 @@ async fn probe_duration(ffprobe: &Path, path: &Path, timeout: Duration) -> Optio
     let mut command = tokio::process::Command::new(ffprobe);
     command
         .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1"])
+        .args(["-protocol_whitelist", "file,pipe", "-i"])
         .arg(path)
         .stdin(Stdio::null())
         .kill_on_drop(true);
@@ -266,7 +304,7 @@ async fn split_audio(
     let pattern = dir.join("segment_%04d.mp3");
     let mut command = tokio::process::Command::new(ffmpeg);
     command
-        .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-i"])
+        .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-protocol_whitelist", "file,pipe", "-i"])
         .arg(input)
         .args(["-vn", "-map", "0:a:0", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame"])
         .args(["-b:a", &format!("{}", SEGMENT_BITRATE / 1000 * 1000)])
@@ -440,6 +478,29 @@ mod tests {
         };
         let error = extract_content(ExtractInput::file(&audio), &ctx(Some(model), missing)).await.unwrap_err();
         assert!(matches!(&error, ContentError::Configuration(m) if m.contains("ffmpeg")), "{error:?}");
+    }
+
+    /// Issue #27: a text playlist or concat script named like audio (one NUL
+    /// is enough to pass as binary) is refused, not handed to ffmpeg or the
+    /// speech model.
+    #[tokio::test]
+    async fn playlists_and_concat_scripts_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases: [(&str, &[u8]); 4] = [
+            ("list.mp3", b"#EXTM3U\n#EXTINF:1,\nfile:///etc/passwd\n\0"),
+            ("bom.wav", b"\xEF\xBB\xBF  #EXTM3U\n#EXTINF:1,\nother.mp3\n\0"),
+            ("concat.mp3", b"ffconcat version 1.0\nfile '/data/other.mp3'\n\0"),
+            ("video.mp4", b"\n\nffconcat version 1.0\nfile 'x.mp4'\n\0"),
+        ];
+        for (name, bytes) in cases {
+            let path = write(&dir, name, bytes);
+            let model = Arc::new(MockStt::default());
+            let error = extract_content(ExtractInput::file(&path), &ctx(Some(model.clone()), no_ffmpeg()))
+                .await
+                .unwrap_err();
+            assert!(matches!(&error, ContentError::UnsupportedType { .. }), "{name}: {error:?}");
+            assert!(model.requests.lock().unwrap().is_empty(), "{name}");
+        }
     }
 
     #[tokio::test]

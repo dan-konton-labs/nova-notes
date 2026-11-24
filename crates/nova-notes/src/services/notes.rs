@@ -38,6 +38,11 @@ pub const EXPLAINER_CSP_HEADER: &str = "sandbox allow-scripts; default-src 'none
      style-src 'unsafe-inline'; img-src data:; font-src data:; media-src data:; connect-src 'none'; \
      form-action 'none'; base-uri 'none'";
 
+/// `Content-Security-Policy` for an uploaded HTML note (and any other inert
+/// file): an opaque origin with no scripts, and nothing loaded from anywhere
+/// but inline `data:` images and styles, so it cannot fetch a remote URL.
+pub const UPLOADED_HTML_CSP_HEADER: &str = "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'";
+
 /// Longest title (and stored file name) taken from an uploaded file's name.
 pub const MAX_NOTE_FILE_TITLE: usize = 200;
 /// Content of a note whose file yielded no text.
@@ -430,7 +435,7 @@ pub async fn note_file(state: &AppState, note_id: &str) -> AppResult<NoteFile> {
         SVG_MIME => Some(INFOGRAPHIC_CSP_HEADER),
         "text/html" if note.explainer.unwrap_or(false) => Some(EXPLAINER_CSP_HEADER),
         // Uploaded HTML must never run scripts in the app's origin.
-        "text/html" => Some("sandbox"),
+        "text/html" => Some(UPLOADED_HTML_CSP_HEADER),
         _ => None,
     };
     Ok(NoteFile {
